@@ -1,0 +1,30 @@
+# Visual Studio temporary files and user settings
+.vs/
+*.aps
+*.user
+*.userosscache
+*.sln.docstates
+*.suo
+
+# Build artifacts & binaries
+x64/
+x86/
+ARM/
+ARM64/
+Debug/
+Release/
+KVMSwitch/
+[Bb]in/
+[Oo]bj/
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.obj
+*.tlog
+*.lastbuildstate
+*.idb
+*.iobj
+*.ipdb
+*.res
+*.log
