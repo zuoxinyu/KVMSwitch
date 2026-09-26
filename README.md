@@ -9,9 +9,12 @@
 ## 核心特性
 
 - **纯原生实现**：基于 Windows 原生 `dxva2.dll` 与 VESA MCCS DDC/CI 协议开发，体积仅约 190 KB，零外部依赖，不弹黑框。
-- **快捷弹出菜单 (Menu 模式)**：双击程序在鼠标指针位置弹出快捷选择菜单，标明当前激活的输入源，点击即可切换。
+- **常驻系统托盘 (Tray 模式)**：默认常驻 Windows 任务栏通知区域，鼠标悬浮即可查看当前激活的输入源，单击或右击随时唤出快捷切换菜单。
+- **开机自启动支持**：在托盘菜单中一键勾选“开机自启动 (常驻系统托盘)”，或通过命令行快速配置，开机登录后静默常驻后台。
+- **单实例与通信机制**：已在托盘运行时再次双击不会重复创建图标，而是直接呼出切换菜单；通过快捷方式或命令行切换输入源时，常驻托盘会自动同步更新状态与悬浮提示。
+- **快捷弹出菜单 (Menu 模式)**：鼠标光标位置即刻弹出快捷选择菜单，标明当前激活的输入源，点击即可切换。
 - **一键轮换 (Toggle 模式)**：在常用输入源（如 DP ⇄ Type-C ⇄ HDMI）之间顺序轮流切换。
-- **桌面快捷方式一键生成**：内置 `--create-shortcuts` 功能，一键在桌面生成对应各输入源的 `.lnk` 快捷方式，可自由设置全局热键。
+- **桌面快捷方式一键生成**：内置 `--create-shortcuts` 功能，一键在桌面生成对应各输入源及托盘常驻的 `.lnk` 快捷方式，可自由设置全局热键。
 - **联动执行命令**：支持在切换到指定输入源时，在后台静默执行系统命令（例如联动唤醒睡眠中的 Mac 等）。
 - **Per-Monitor 高 DPI 感知**：完美适配 4K 及高分屏。
 
@@ -33,15 +36,19 @@
 ## 命令行参数
 
 ```text
-KVMSwitch.exe                     根据 config.ini 配置运行 (默认弹出菜单)
+KVMSwitch.exe                     根据 config.ini 配置运行 (默认启动并常驻系统托盘)
+KVMSwitch.exe --tray              强制以系统托盘常驻模式启动
 KVMSwitch.exe dp                  直接切换到 DisplayPort (DP)
 KVMSwitch.exe hdmi1               直接切换到 HDMI 1
 KVMSwitch.exe hdmi2               直接切换到 HDMI 2
 KVMSwitch.exe typec               直接切换到 USB Type-C
 KVMSwitch.exe <数值>              直接切换到指定 VCP 60 数值 (如 15, 16, 17, 18)
 KVMSwitch.exe --toggle (-t)       在常用输入源之间轮换切换
-KVMSwitch.exe --menu (-m)         强制弹出快速选择菜单
+KVMSwitch.exe --menu (-m)         强制弹出快速选择菜单 (单次模式)
 KVMSwitch.exe --query (-q)        探测并显示当前所有显示器及输入源状态
+KVMSwitch.exe --autostart-enable   开启开机自启动 (常驻系统托盘)
+KVMSwitch.exe --autostart-disable  关闭开机自启动
+KVMSwitch.exe --autostart-status   查询开机自启动状态
 KVMSwitch.exe --create-shortcuts  在桌面生成一键切换快捷方式
 KVMSwitch.exe --help (-h)         查看帮助信息
 ```
@@ -54,8 +61,8 @@ KVMSwitch.exe --help (-h)         查看帮助信息
 
 ```ini
 [General]
-; 运行模式: menu (弹出快捷菜单) 或 toggle (一键轮换)
-mode = menu
+; 运行模式: tray (常驻系统托盘，推荐)、menu (弹出快捷菜单) 或 toggle (一键轮换)
+mode = tray
 
 ; 切换成功后是否显示气泡提示
 notify = true
@@ -77,7 +84,7 @@ TypeC = 15
 [Commands]
 ; 切换到指定输入源后自动在后台执行的系统命令 (可选)
 on_switch_to_typec = ssh mac caffeinate -u -t 2
-on_switch_to_hdmi1 = ssh mac caffeinate -u -t 2
+on_switch_to_hdmi1 = 
 on_switch_to_hdmi2 = 
 on_switch_to_dp = 
 ```
@@ -86,8 +93,9 @@ on_switch_to_dp =
 
 ## 编译方法
 
-使用 Visual Studio 2022 / 2026 打开 `KVMSwitch.sln`，选择 `Release` 与 `x64` 进行生成；或通过命令行生成：
+使用 Visual Studio 打开 `KVMSwitch.sln`，选择 `Release` 与 `x64` 进行生成；或通过命令行生成：
 
 ```powershell
 MSBuild KVMSwitch.sln /p:Configuration=Release /p:Platform=x64
 ```
+

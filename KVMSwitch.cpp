@@ -32,8 +32,18 @@ void ShowQueryInfo(const MonitorContext& ctx, const AppConfig* pCfg);
 #define ID_ACTION_CONFIG    3003
 #define ID_ACTION_QUERY     3004
 #define ID_ACTION_EXIT      3005
+#define ID_ACTION_AUTOSTART 3006
 
+#define TIMER_ID_REFRESH    1001
 #define WM_TRAYNOTIFY       (WM_USER + 101)
+
+// 全局托盘相关变量
+static NOTIFYICONDATAW g_trayNid = { sizeof(NOTIFYICONDATAW) };
+static HWND g_hTrayWnd = NULL;
+static HINSTANCE g_hInstance = NULL;
+static UINT g_wmTaskbarCreated = 0;
+static UINT g_wmShowMenu = 0;
+static UINT g_wmRefresh = 0;
 
 // 数据结构
 struct PhysicalMonEntry {
@@ -111,6 +121,42 @@ std::wstring GetExeDir() {
 
 std::wstring GetConfigPath() {
     return GetExeDir() + L"\\config.ini";
+}
+
+// Windows 开机自启动管理 (注册表 HKCU\...\Run)
+const wchar_t* REG_RUN_KEY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const wchar_t* REG_APP_NAME = L"KVMSwitch";
+
+bool IsAutoStartEnabled() {
+    HKEY hKey = NULL;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        wchar_t val[MAX_PATH * 2] = { 0 };
+        DWORD size = sizeof(val);
+        DWORD type = 0;
+        LONG res = RegQueryValueExW(hKey, REG_APP_NAME, NULL, &type, reinterpret_cast<LPBYTE>(val), &size);
+        RegCloseKey(hKey);
+        return (res == ERROR_SUCCESS);
+    }
+    return false;
+}
+
+bool SetAutoStart(bool enable) {
+    HKEY hKey = NULL;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY, 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        LONG res = 0;
+        if (enable) {
+            std::wstring exePath = GetExePath();
+            std::wstring cmd = L"\"" + exePath + L"\" --tray";
+            res = RegSetValueExW(hKey, REG_APP_NAME, 0, REG_SZ,
+                reinterpret_cast<const BYTE*>(cmd.c_str()),
+                static_cast<DWORD>((cmd.length() + 1) * sizeof(wchar_t)));
+        } else {
+            res = RegDeleteValueW(hKey, REG_APP_NAME);
+        }
+        RegCloseKey(hKey);
+        return (res == ERROR_SUCCESS || (!enable && res == ERROR_FILE_NOT_FOUND));
+    }
+    return false;
 }
 
 // 解析输入源代码与名称
@@ -196,9 +242,10 @@ void EnsureConfigFile(const std::wstring& cfgPath) {
         L"\r\n"
         L"[General]\r\n"
         L"; 运行模式:\r\n"
-        L"; menu   - 点击时弹出快捷选择菜单 (HDMI/DP/Type-C 等)\r\n"
-        L"; toggle - 点击直接在 toggle_inputs 中轮流切换 (适合作为快捷方式一键切换)\r\n"
-        L"mode = menu\r\n"
+        L"; tray   - 常驻系统托盘图标 (推荐，随时在任务栏右下角切换、监控状态)\r\n"
+        L"; menu   - 单次运行弹出快捷选择菜单后退出\r\n"
+        L"; toggle - 单次运行直接在 toggle_inputs 中轮流切换后退出\r\n"
+        L"mode = tray\r\n"
         L"\r\n"
         L"; 切换成功后是否显示桌面气泡通知 (true / false)\r\n"
         L"notify = true\r\n"
@@ -252,10 +299,10 @@ AppConfig LoadConfig(const std::wstring& cfgPath, DWORD detectedTypeCCode = 15) 
     AppConfig cfg;
     wchar_t buf[512] = { 0 };
 
-    GetPrivateProfileStringW(L"General", L"mode", L"menu", buf, 512, cfgPath.c_str());
+    GetPrivateProfileStringW(L"General", L"mode", L"tray", buf, 512, cfgPath.c_str());
     cfg.mode = ToUpper(Trim(buf));
-    if (cfg.mode != L"TOGGLE" && cfg.mode != L"MENU") {
-        cfg.mode = L"MENU";
+    if (cfg.mode != L"TOGGLE" && cfg.mode != L"MENU" && cfg.mode != L"TRAY") {
+        cfg.mode = L"TRAY";
     }
 
     GetPrivateProfileStringW(L"General", L"notify", L"true", buf, 512, cfgPath.c_str());
@@ -437,6 +484,42 @@ void FreeMonitorContext(MonitorContext& ctx) {
     ctx.monitorPhysicalCounts.clear();
 }
 
+// 托盘状态与气泡提示管理
+void UpdateTrayTooltip(HWND hWnd, const AppConfig* pCfg = nullptr, DWORD forcedCurrentInput = 0) {
+    if (!g_hTrayWnd || !IsWindow(g_hTrayWnd)) return;
+
+    DWORD curInput = forcedCurrentInput;
+    if (curInput == 0) {
+        MonitorContext ctx = QueryAllMonitors();
+        if (!ctx.monitors.empty()) {
+            const PhysicalMonEntry* pMon = nullptr;
+            for (const auto& m : ctx.monitors) {
+                if (m.isPrimary) { pMon = &m; break; }
+            }
+            if (!pMon) pMon = &ctx.monitors[0];
+            curInput = pMon->currentInput;
+        }
+        FreeMonitorContext(ctx);
+    }
+
+    std::wstring iname = curInput ? GetInputName(curInput, pCfg) : L"未知";
+    wchar_t tip[128] = { 0 };
+    swprintf_s(tip, L"KVMSwitch\n当前输入: %s (0x%02X)", iname.c_str(), curInput);
+    wcscpy_s(g_trayNid.szTip, tip);
+    g_trayNid.uFlags = NIF_TIP;
+    Shell_NotifyIconW(NIM_MODIFY, &g_trayNid);
+}
+
+void ShowTrayBalloon(const std::wstring& title, const std::wstring& msg) {
+    if (g_hTrayWnd && IsWindow(g_hTrayWnd)) {
+        g_trayNid.uFlags = NIF_INFO;
+        wcscpy_s(g_trayNid.szInfoTitle, title.c_str());
+        wcscpy_s(g_trayNid.szInfo, msg.c_str());
+        g_trayNid.dwInfoFlags = NIIF_INFO;
+        Shell_NotifyIconW(NIM_MODIFY, &g_trayNid);
+    }
+}
+
 // 执行输入源切换
 bool SetMonitorInputSource(HANDLE hPhysMon, DWORD targetInput) {
     for (int retry = 0; retry < 3; ++retry) {
@@ -489,14 +572,16 @@ void CreateAllShortcuts() {
     CreateDesktopShortcut(L"切换显示器 - HDMI 2", L"hdmi2", L"一键切换显示器至 HDMI 2 输入");
     CreateDesktopShortcut(L"切换显示器 - Type-C", L"typec", L"一键切换显示器至 USB Type-C 输入");
     CreateDesktopShortcut(L"切换显示器 - 轮流切换", L"--toggle", L"在常用输入源之间轮流快速切换");
+    CreateDesktopShortcut(L"KVMSwitch (系统托盘常驻)", L"--tray", L"启动 KVMSwitch 并常驻系统托盘");
 
     MessageBoxW(NULL,
-        L"已成功在桌面创建以下 5 个快捷方式：\n\n"
+        L"已成功在桌面创建以下 6 个快捷方式：\n\n"
         L"1. 切换显示器 - DP (DisplayPort)\n"
         L"2. 切换显示器 - HDMI 1\n"
         L"3. 切换显示器 - HDMI 2\n"
         L"4. 切换显示器 - Type-C\n"
-        L"5. 切换显示器 - 轮流切换 (Toggle)\n\n"
+        L"5. 切换显示器 - 轮流切换 (Toggle)\n"
+        L"6. KVMSwitch (系统托盘常驻)\n\n"
         L"您可以直接在桌面双击，或将其拖动到任务栏、为快捷方式设置全局热键！",
         L"快捷方式创建成功", MB_OK | MB_ICONINFORMATION);
 }
@@ -574,7 +659,15 @@ bool DoSwitch(HINSTANCE hInstance, DWORD targetCode, const AppConfig& cfg, Monit
         if (cfg.notify) {
             std::wstring iname = GetInputName(targetCode, &cfg);
             std::wstring tip = L"显示器输入源已切换至: " + iname;
-            ShowNotification(hInstance, L"KVMSwitch 输入切换", tip);
+            if (g_hTrayWnd && IsWindow(g_hTrayWnd)) {
+                ShowTrayBalloon(L"KVMSwitch 输入切换", tip);
+            } else {
+                ShowNotification(hInstance, L"KVMSwitch 输入切换", tip);
+            }
+        }
+
+        if (g_hTrayWnd && IsWindow(g_hTrayWnd)) {
+            UpdateTrayTooltip(g_hTrayWnd, &cfg, targetCode);
         }
     } else {
         MessageBoxW(NULL,
@@ -585,8 +678,11 @@ bool DoSwitch(HINSTANCE hInstance, DWORD targetCode, const AppConfig& cfg, Monit
     return anySuccess;
 }
 
+
 // 弹出快捷菜单
-void ShowQuickMenu(HINSTANCE hInstance, const AppConfig& cfg, MonitorContext& ctx, DWORD detectedTypeCCode) {
+void ShowQuickMenu(HINSTANCE hInstance, const AppConfig& cfg, MonitorContext& ctx, DWORD detectedTypeCCode, HWND hOwnerWnd = NULL) {
+    UNREFERENCED_PARAMETER(hOwnerWnd);
+
     // 确定主显示器或首个显示器
     const PhysicalMonEntry* targetMon = nullptr;
     for (const auto& m : ctx.monitors) {
@@ -627,14 +723,17 @@ void ShowQuickMenu(HINSTANCE hInstance, const AppConfig& cfg, MonitorContext& ct
         return getWeight(a) < getWeight(b);
     });
 
-    // 创建菜单窗口与菜单
+    // 创建菜单接收窗口与菜单
     WNDCLASSEXW wc = { sizeof(wc) };
-    wc.lpfnWndProc = DefWindowProcW;
-    wc.hInstance = hInstance;
-    wc.lpszClassName = L"KVMSwitchMenuDummyClass";
-    RegisterClassExW(&wc);
+    if (!GetClassInfoExW(hInstance, L"KVMSwitchMenuDummyClass", &wc)) {
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = hInstance;
+        wc.lpszClassName = L"KVMSwitchMenuDummyClass";
+        RegisterClassExW(&wc);
+    }
 
-    HWND hWnd = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"", WS_POPUP, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
+    HWND hWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"KVMSwitchMenuDummyClass", L"", WS_POPUP, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
     if (!hWnd) return;
 
     HMENU hMenu = CreatePopupMenu();
@@ -668,10 +767,18 @@ void ShowQuickMenu(HINSTANCE hInstance, const AppConfig& cfg, MonitorContext& ct
     AppendMenuW(hMenu, MF_STRING, ID_ACTION_SHORTCUTS, L"🔗 创建桌面快捷方式 (一键切换)");
     AppendMenuW(hMenu, MF_STRING, ID_ACTION_CONFIG, L"⚙️ 打开配置文件 (config.ini)");
     AppendMenuW(hMenu, MF_STRING, ID_ACTION_QUERY, L"🔍 检测显示器信息与输入状态");
+
+    // 开机自启动选项
+    UINT autoStartFlags = MF_STRING;
+    if (IsAutoStartEnabled()) {
+        autoStartFlags |= MF_CHECKED;
+    }
+    AppendMenuW(hMenu, autoStartFlags, ID_ACTION_AUTOSTART, L"🚀 开机自启动 (常驻系统托盘)");
+
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_ACTION_EXIT, L"✕ 退出");
 
-    // 弹出菜单
+    // 弹出菜单并保证失焦自动隐藏 (遵循 Microsoft 托盘菜单准则)
     POINT pt;
     GetCursorPos(&pt);
     SetForegroundWindow(hWnd);
@@ -681,7 +788,6 @@ void ShowQuickMenu(HINSTANCE hInstance, const AppConfig& cfg, MonitorContext& ct
 
     DestroyMenu(hMenu);
     DestroyWindow(hWnd);
-    UnregisterClassW(wc.lpszClassName, hInstance);
 
     // 处理菜单动作
     if (cmd >= ID_INPUT_BASE && cmd < currentMenuId) {
@@ -704,6 +810,18 @@ void ShowQuickMenu(HINSTANCE hInstance, const AppConfig& cfg, MonitorContext& ct
         ShellExecuteW(NULL, L"open", cfgPath.c_str(), NULL, NULL, SW_SHOWNORMAL);
     } else if (cmd == ID_ACTION_QUERY) {
         ShowQueryInfo(ctx, &cfg);
+    } else if (cmd == ID_ACTION_AUTOSTART) {
+        bool enabled = IsAutoStartEnabled();
+        SetAutoStart(!enabled);
+        if (g_hTrayWnd && IsWindow(g_hTrayWnd)) {
+            ShowTrayBalloon(L"KVMSwitch 开机自启动", !enabled ? L"已开启开机自启动 (常驻系统托盘)。" : L"已关闭开机自启动。");
+        } else {
+            MessageBoxW(NULL, !enabled ? L"已开启开机自启动 (常驻系统托盘)。" : L"已关闭开机自启动。", L"开机自启动设置", MB_OK | MB_ICONINFORMATION);
+        }
+    } else if (cmd == ID_ACTION_EXIT) {
+        if (g_hTrayWnd && IsWindow(g_hTrayWnd)) {
+            DestroyWindow(g_hTrayWnd);
+        }
     }
 }
 
@@ -731,6 +849,115 @@ void DoToggle(HINSTANCE hInstance, const AppConfig& cfg, MonitorContext& ctx) {
 
     DoSwitch(hInstance, nextCode, cfg, ctx);
 }
+
+// 托盘窗口过程与常驻主循环
+static AppConfig g_trayCfg;
+static DWORD g_detectedTypeCCode = 15;
+
+LRESULT CALLBACK TrayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == g_wmTaskbarCreated) {
+        // Explorer 重启时重新添加托盘图标
+        Shell_NotifyIconW(NIM_ADD, &g_trayNid);
+        UpdateTrayTooltip(hWnd, &g_trayCfg);
+        return 0;
+    }
+    if (msg == g_wmShowMenu) {
+        g_trayCfg = LoadConfig(GetConfigPath(), g_detectedTypeCCode);
+        MonitorContext ctx = QueryAllMonitors();
+        ShowQuickMenu(g_hInstance, g_trayCfg, ctx, g_detectedTypeCCode, hWnd);
+        FreeMonitorContext(ctx);
+        return 0;
+    }
+    if (msg == g_wmRefresh) {
+        UpdateTrayTooltip(hWnd, &g_trayCfg);
+        return 0;
+    }
+
+    switch (msg) {
+    case WM_CREATE:
+        return 0;
+
+    case WM_TRAYNOTIFY:
+        if (lParam == WM_RBUTTONUP || lParam == WM_LBUTTONUP) {
+            g_trayCfg = LoadConfig(GetConfigPath(), g_detectedTypeCCode);
+            MonitorContext ctx = QueryAllMonitors();
+            ShowQuickMenu(g_hInstance, g_trayCfg, ctx, g_detectedTypeCCode, hWnd);
+            FreeMonitorContext(ctx);
+        }
+        return 0;
+
+    case WM_TIMER:
+        if (wParam == TIMER_ID_REFRESH) {
+            UpdateTrayTooltip(hWnd, &g_trayCfg);
+        }
+        return 0;
+
+    case WM_POWERBROADCAST:
+        UpdateTrayTooltip(hWnd, &g_trayCfg);
+        return TRUE;
+
+    case WM_DESTROY:
+        KillTimer(hWnd, TIMER_ID_REFRESH);
+        Shell_NotifyIconW(NIM_DELETE, &g_trayNid);
+        g_hTrayWnd = NULL;
+        PostQuitMessage(0);
+        return 0;
+    }
+
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+int RunTrayApp(HINSTANCE hInstance, const AppConfig& cfg, DWORD detectedTypeCCode) {
+    g_hInstance = hInstance;
+    g_trayCfg = cfg;
+    g_detectedTypeCCode = detectedTypeCCode;
+
+    // 注册任务栏与进程间通信自定义消息
+    g_wmTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+    g_wmShowMenu = RegisterWindowMessageW(L"KVMSwitch_ShowMenu");
+    g_wmRefresh = RegisterWindowMessageW(L"KVMSwitch_Refresh");
+
+    WNDCLASSEXW wc = { sizeof(wc) };
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = TrayWndProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = L"KVMSwitchTrayWindowClass";
+    RegisterClassExW(&wc);
+
+    g_hTrayWnd = CreateWindowExW(0, wc.lpszClassName, L"KVMSwitchTrayWindow", WS_OVERLAPPED, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
+    if (!g_hTrayWnd) return 1;
+
+    memset(&g_trayNid, 0, sizeof(g_trayNid));
+    g_trayNid.cbSize = sizeof(NOTIFYICONDATAW);
+    g_trayNid.hWnd = g_hTrayWnd;
+    g_trayNid.uID = 1;
+    g_trayNid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_trayNid.uCallbackMessage = WM_TRAYNOTIFY;
+    g_trayNid.hIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(ID_KVMSWITCH));
+    if (!g_trayNid.hIcon) {
+        g_trayNid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    }
+    wcscpy_s(g_trayNid.szTip, L"KVMSwitch - 显示器输入切换");
+    Shell_NotifyIconW(NIM_ADD, &g_trayNid);
+
+    UpdateTrayTooltip(g_hTrayWnd, &g_trayCfg);
+
+    // 开启定时器，每 15 秒更新一次托盘提示 (当前输入状态)
+    SetTimer(g_hTrayWnd, TIMER_ID_REFRESH, 15000, NULL);
+
+    // 启动通知气泡
+    ShowTrayBalloon(L"KVMSwitch", L"已常驻系统托盘，单击或右击托盘图标可快速切换输入源。");
+
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    UnregisterClassW(wc.lpszClassName, hInstance);
+    return 0;
+}
+
 
 static HANDLE g_hStdOut = NULL;
 
@@ -803,16 +1030,20 @@ void ShowHelp() {
     std::wstring helpText =
         L"KVMSwitch - 便携式显示器输入源快速切换工具\n\n"
         L"命令行用法：\n"
-        L"  KVMSwitch.exe                 按 config.ini 配置运行 (默认弹出菜单)\n"
+        L"  KVMSwitch.exe                 按 config.ini 配置运行 (默认常驻系统托盘)\n"
+        L"  KVMSwitch.exe --tray          启动并常驻系统托盘\n"
         L"  KVMSwitch.exe dp              直接切换到 DisplayPort (DP)\n"
         L"  KVMSwitch.exe hdmi1           直接切换到 HDMI 1\n"
         L"  KVMSwitch.exe hdmi2           直接切换到 HDMI 2\n"
         L"  KVMSwitch.exe typec           直接切换到 USB Type-C\n"
         L"  KVMSwitch.exe <数值>          直接切换到指定 VCP 60 数值 (如 15, 16, 17, 18)\n"
         L"  KVMSwitch.exe --toggle (-t)   在常用输入源之间轮换切换\n"
-        L"  KVMSwitch.exe --menu (-m)     强制弹出快速选择菜单\n"
+        L"  KVMSwitch.exe --menu (-m)     强制弹出快速选择菜单 (单次模式)\n"
         L"  KVMSwitch.exe --query (-q)    检测并显示当前所有显示器及输入源状态\n"
-        L"  KVMSwitch.exe --create-shortcuts  在桌面生成一键切换快捷方式\n"
+        L"  KVMSwitch.exe --autostart-enable   开启开机自启动 (常驻系统托盘)\n"
+        L"  KVMSwitch.exe --autostart-disable  关闭开机自启动\n"
+        L"  KVMSwitch.exe --autostart-status   查询开机自启动状态\n"
+        L"  KVMSwitch.exe --create-shortcuts   在桌面生成一键切换快捷方式\n"
         L"  KVMSwitch.exe --help (-h)     查看本帮助信息\n";
 
     PrintOutput(helpText, L"KVMSwitch 帮助");
@@ -833,12 +1064,46 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     // 启用 Per-Monitor 高 DPI 感知，保证菜单在高分辨率屏下清晰
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
+    // 注册进程间通信自定义消息
+    g_wmShowMenu = RegisterWindowMessageW(L"KVMSwitch_ShowMenu");
+    g_wmRefresh = RegisterWindowMessageW(L"KVMSwitch_Refresh");
+
+    // 单实例互斥量检测
+    HANDLE hMutex = CreateMutexW(NULL, FALSE, L"Local\\KVMSwitch_SingleInstance_Mutex_zuoxinyu");
+    bool alreadyRunning = (GetLastError() == ERROR_ALREADY_EXISTS);
+
+    // 处理自启动控制命令行参数 (不依赖硬件查询，快速执行)
+    std::wstring cmdLine = lpCmdLine ? lpCmdLine : L"";
+    std::wstring trimmedCmd = ToUpper(Trim(cmdLine));
+
+    if (trimmedCmd == L"--AUTOSTART-ENABLE") {
+        SetAutoStart(true);
+        PrintOutput(L"开机自启动已启用 (将在登录系统后自动常驻系统托盘)。", L"KVMSwitch");
+        if (hMutex) CloseHandle(hMutex);
+        return 0;
+    } else if (trimmedCmd == L"--AUTOSTART-DISABLE") {
+        SetAutoStart(false);
+        PrintOutput(L"开机自启动已禁用。", L"KVMSwitch");
+        if (hMutex) CloseHandle(hMutex);
+        return 0;
+    } else if (trimmedCmd == L"--AUTOSTART-STATUS") {
+        bool enabled = IsAutoStartEnabled();
+        PrintOutput(enabled ? L"开机自启动状态: 已启用 (Enabled)" : L"开机自启动状态: 已禁用 (Disabled)", L"KVMSwitch");
+        if (hMutex) CloseHandle(hMutex);
+        return 0;
+    } else if (trimmedCmd == L"--HELP" || trimmedCmd == L"-H" || trimmedCmd == L"/?" || trimmedCmd == L"HELP") {
+        ShowHelp();
+        if (hMutex) CloseHandle(hMutex);
+        return 0;
+    }
+
     // 枚举显示器
     MonitorContext ctx = QueryAllMonitors();
     if (ctx.monitors.empty()) {
         MessageBoxW(NULL,
             L"未检测到支持 DDC/CI 的显示器！\n\n请确认：\n1. 显示器 OSD 菜单中已开启 DDC/CI\n2. 显卡驱动已正常安装",
             L"KVMSwitch 错误", MB_OK | MB_ICONERROR);
+        if (hMutex) CloseHandle(hMutex);
         return 1;
     }
 
@@ -861,25 +1126,51 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     std::wstring cfgPath = GetConfigPath();
     AppConfig cfg = LoadConfig(cfgPath, detectedTypeCCode);
 
-    // 处理命令行参数
-    std::wstring cmdLine = lpCmdLine ? lpCmdLine : L"";
-    std::wstring trimmedCmd = ToUpper(Trim(cmdLine));
-
     int exitCode = 0;
 
-    if (trimmedCmd.empty()) {
-        // 无参数运行：根据配置决定是弹出菜单还是轮换切换
-        if (cfg.mode == L"TOGGLE") {
+    if (trimmedCmd == L"--TRAY" || trimmedCmd == L"-TRAY" || trimmedCmd == L"TRAY") {
+        if (alreadyRunning) {
+            HWND hTray = FindWindowW(L"KVMSwitchTrayWindowClass", NULL);
+            if (hTray) {
+                PostMessageW(hTray, g_wmShowMenu, 0, 0);
+            }
+        } else {
+            FreeMonitorContext(ctx);
+            exitCode = RunTrayApp(hInstance, cfg, detectedTypeCCode);
+            if (hMutex) CloseHandle(hMutex);
+            return exitCode;
+        }
+    } else if (trimmedCmd.empty()) {
+        // 无命令行参数运行
+        if (cfg.mode == L"TRAY") {
+            if (alreadyRunning) {
+                HWND hTray = FindWindowW(L"KVMSwitchTrayWindowClass", NULL);
+                if (hTray) {
+                    PostMessageW(hTray, g_wmShowMenu, 0, 0);
+                }
+            } else {
+                FreeMonitorContext(ctx);
+                exitCode = RunTrayApp(hInstance, cfg, detectedTypeCCode);
+                if (hMutex) CloseHandle(hMutex);
+                return exitCode;
+            }
+        } else if (cfg.mode == L"TOGGLE") {
             DoToggle(hInstance, cfg, ctx);
+            if (alreadyRunning) {
+                HWND hTray = FindWindowW(L"KVMSwitchTrayWindowClass", NULL);
+                if (hTray) PostMessageW(hTray, g_wmRefresh, 0, 0);
+            }
         } else {
             ShowQuickMenu(hInstance, cfg, ctx, detectedTypeCCode);
         }
-    } else if (trimmedCmd == L"--HELP" || trimmedCmd == L"-H" || trimmedCmd == L"/?" || trimmedCmd == L"HELP") {
-        ShowHelp();
     } else if (trimmedCmd == L"--MENU" || trimmedCmd == L"-M" || trimmedCmd == L"MENU") {
         ShowQuickMenu(hInstance, cfg, ctx, detectedTypeCCode);
     } else if (trimmedCmd == L"--TOGGLE" || trimmedCmd == L"-T" || trimmedCmd == L"TOGGLE") {
         DoToggle(hInstance, cfg, ctx);
+        if (alreadyRunning) {
+            HWND hTray = FindWindowW(L"KVMSwitchTrayWindowClass", NULL);
+            if (hTray) PostMessageW(hTray, g_wmRefresh, 0, 0);
+        }
     } else if (trimmedCmd == L"--CREATE-SHORTCUTS" || trimmedCmd == L"SHORTCUTS") {
         CreateAllShortcuts();
     } else if (trimmedCmd == L"--QUERY" || trimmedCmd == L"-Q" || trimmedCmd == L"QUERY") {
@@ -894,6 +1185,10 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         DWORD targetCode = ParseInputAlias(targetStr, cfg, detectedTypeCCode);
         if (targetCode > 0) {
             DoSwitch(hInstance, targetCode, cfg, ctx);
+            if (alreadyRunning) {
+                HWND hTray = FindWindowW(L"KVMSwitchTrayWindowClass", NULL);
+                if (hTray) PostMessageW(hTray, g_wmRefresh, 0, 0);
+            }
         } else {
             std::wstring err = L"无法识别的输入源参数: " + cmdLine + L"\n\n支持的参数示例: dp, hdmi1, hdmi2, typec 或数值 15, 17, 18, 16";
             MessageBoxW(NULL, err.c_str(), L"KVMSwitch 错误", MB_OK | MB_ICONERROR);
@@ -903,5 +1198,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 
     // 释放资源
     FreeMonitorContext(ctx);
+    if (hMutex) CloseHandle(hMutex);
     return exitCode;
 }
+
