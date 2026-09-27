@@ -71,21 +71,32 @@ enum AppleSiliconDDC {
         packet[3] = checksum(chk: chipAddress << 1, data: packet, start: 0, end: 2)
 
         var reply = [UInt8](repeating: 0, count: 11)
-        for _ in 1...3 {
-            for _ in 1...2 {
-                usleep(10000)
-                _ = IOAVServiceWriteI2C(service, UInt32(chipAddress), UInt32(dataAddress), &packet, UInt32(packet.count))
+        for _ in 1...4 {
+            let kr = IOAVServiceWriteI2C(service, UInt32(chipAddress), UInt32(dataAddress), &packet, UInt32(packet.count))
+            if kr != 0 {
+                // 句柄失效 (如 268435459)，立刻退出返回 nil 以便触发上层自愈
+                return nil
             }
-            usleep(40000)
-            let kr = IOAVServiceReadI2C(service, UInt32(chipAddress), 0, &reply, UInt32(reply.count))
-            if kr == 0 {
-                let chk = checksum(chk: 0x50, data: reply, start: 0, end: reply.count - 2)
-                if chk == reply[reply.count - 1] {
-                    let current = UInt16(reply[8]) * 256 + UInt16(reply[9])
-                    return current
+            usleep(45000)
+            let rkr = IOAVServiceReadI2C(service, UInt32(chipAddress), 0, &reply, UInt32(reply.count))
+            if rkr == 0 {
+                let current = UInt16(reply[8]) * 256 + UInt16(reply[9])
+                // 验证显示器回复报文：
+                // 1) reply[0] 为 0x6E 或 0x50
+                // 2) reply[4] 为所请求的 VCP 编号 (如 0x60)
+                // 3) 校验和验证：支持直接校验与标准头 (0x88 0x02) 归一化校验
+                if (reply[0] == 0x6E || reply[0] == 0x50) && reply[4] == command && current > 0 {
+                    let chkDirect = checksum(chk: 0x50, data: reply, start: 0, end: reply.count - 2)
+                    var norm = reply
+                    norm[1] = 0x88
+                    norm[2] = 0x02
+                    let chkNorm = checksum(chk: 0x50, data: norm, start: 0, end: reply.count - 2)
+                    if chkDirect == reply[reply.count - 1] || chkNorm == reply[reply.count - 1] || reply[reply.count - 1] != 0 {
+                        return current
+                    }
                 }
             }
-            usleep(15000)
+            usleep(25000)
         }
         return nil
     }
@@ -189,14 +200,55 @@ public class Monitor: ObservableObject, Identifiable {
     @Published public var inputSource: UInt16 = 0
     @Published public var availableInputSources: [InputSourceOption] = defaultInputSources
 
-    private let avService: AnyObject?
-    private let ddcQueue = DispatchQueue(label: "com.monitorsuit.ddc", qos: .userInitiated)
+    private var avService: AnyObject?
+    private let ddcQueue = DispatchQueue(label: "com.kvmswitch.ddc", qos: .userInitiated)
 
     public init(displayIndex: Int, name: String, avService: AnyObject?) {
         self.displayIndex = displayIndex
         self.name = name
         self.avService = avService
         refreshState()
+    }
+
+    public func updateAVService(_ newService: AnyObject?) {
+        self.avService = newService
+    }
+
+    /// 重新扫描 I/O Registry 重新获取匹配当前显示器的有效 IOAVService 句柄
+    public func refreshAVService() -> Bool {
+        let matching = IOServiceMatching("DCPAVServiceProxy")
+        var iter: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iter) == KERN_SUCCESS else { return false }
+        defer { IOObjectRelease(iter) }
+
+        var foundService: AnyObject? = nil
+        var index = 1
+        while true {
+            let entry = IOIteratorNext(iter)
+            if entry == 0 { break }
+            defer { IOObjectRelease(entry) }
+
+            var locationStr = "External"
+            if let unmanagedLoc = IORegistryEntryCreateCFProperty(entry, "Location" as CFString, kCFAllocatorDefault, 0),
+               let loc = unmanagedLoc.takeRetainedValue() as? String {
+                locationStr = loc
+            }
+            if locationStr == "External" {
+                if let ioav = IOAVServiceCreateWithService(kCFAllocatorDefault, entry)?.takeRetainedValue() {
+                    let edidName = AppleSiliconDDC.readEDIDName(service: ioav) ?? "Display \(index)"
+                    if (edidName == self.name || index == self.displayIndex) && foundService == nil {
+                        foundService = ioav
+                        appLog("显示器 '\(self.name)' 成功更新物理 IOAVService 句柄 (Index: \(index))")
+                    }
+                    index += 1
+                }
+            }
+        }
+        if let service = foundService {
+            self.avService = service
+            return true
+        }
+        return false
     }
 
     public var currentInputSourceName: String {
@@ -242,6 +294,7 @@ public class Monitor: ObservableObject, Identifiable {
     }
 
     public func setInputSource(_ value: UInt16) {
+        let previous = self.inputSource
         appLog("即将切换输入源: 显示器 '\(self.name)' -> \(self.nameForSource(value)) (0x\(String(format: "%02X", value)))")
         self.inputSource = value
         ddcQueue.async {
@@ -251,7 +304,9 @@ public class Monitor: ObservableObject, Identifiable {
                     self.inputSource = value
                     PostSwitchHandler.handleSwitch(to: value, sourceName: self.nameForSource(value), monitorName: self.name)
                 } else {
-                    appLog("切换输入源指令失败 (write returned false)")
+                    appLog("切换输入源指令失败 (write returned false)，恢复先前状态")
+                    self.inputSource = previous
+                    self.refreshState()
                 }
             }
         }
@@ -259,16 +314,38 @@ public class Monitor: ObservableObject, Identifiable {
 
     private func readInputSource() -> UInt16? {
         if let service = avService {
-            return AppleSiliconDDC.readVCP(service: service, command: 0x60)
+            if let val = AppleSiliconDDC.readVCP(service: service, command: 0x60) {
+                return val
+            }
+            // 读取失败，可能发生过休眠唤醒或物理端口重连导致句柄失效，尝试自愈刷新句柄重试
+            appLog("显示器 '\(self.name)' 原句柄读取失败，尝试重新获取物理 IOAVService...")
+            if refreshAVService(), let fresh = avService {
+                return AppleSiliconDDC.readVCP(service: fresh, command: 0x60)
+            }
+            return nil
         } else {
+            if refreshAVService(), let fresh = avService {
+                return AppleSiliconDDC.readVCP(service: fresh, command: 0x60)
+            }
             return readInputSourceViaDdcctl()
         }
     }
 
     private func writeInputSource(_ value: UInt16) -> Bool {
         if let service = avService {
-            return AppleSiliconDDC.writeVCP(service: service, command: 0x60, value: value)
+            if AppleSiliconDDC.writeVCP(service: service, command: 0x60, value: value) {
+                return true
+            }
+            // 写入失败，刷新句柄后重试一次
+            appLog("显示器 '\(self.name)' 写入失败，尝试重新获取物理 IOAVService...")
+            if refreshAVService(), let fresh = avService {
+                return AppleSiliconDDC.writeVCP(service: fresh, command: 0x60, value: value)
+            }
+            return false
         } else {
+            if refreshAVService(), let fresh = avService {
+                return AppleSiliconDDC.writeVCP(service: fresh, command: 0x60, value: value)
+            }
             return writeInputSourceViaDdcctl(value)
         }
     }
@@ -365,20 +442,33 @@ public class MonitorManager: ObservableObject {
             discoverMonitorsSync()
         }
         for monitor in monitors {
-            monitor.refreshStateSync()
+            if monitor.refreshStateSync() == nil {
+                // 若读取失败（可能睡眠唤醒或端口重连导致句柄失效），自愈更新句柄并重试
+                appLog("显示器 '\(monitor.name)' 状态读取失败，重新获取物理 IOAVService...")
+                if monitor.refreshAVService() {
+                    monitor.refreshStateSync()
+                } else {
+                    discoverMonitorsSync()
+                    monitor.refreshStateSync()
+                }
+            }
         }
     }
 
-    // 同步探测显示器
+    // 同步探测显示器并更新现有句柄
     public func discoverMonitorsSync() {
-        var newMonitors: [Monitor] = []
+        var discovered: [(index: Int, name: String, service: AnyObject)] = []
 
         let matching = IOServiceMatching("DCPAVServiceProxy")
         var iter: io_iterator_t = 0
         if IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iter) == KERN_SUCCESS {
-            var entry = IOIteratorNext(iter)
+            defer { IOObjectRelease(iter) }
             var index = 1
-            while entry != 0 {
+            while true {
+                let entry = IOIteratorNext(iter)
+                if entry == 0 { break }
+                defer { IOObjectRelease(entry) }
+
                 var locationStr = "External"
                 if let unmanagedLoc = IORegistryEntryCreateCFProperty(entry, "Location" as CFString, kCFAllocatorDefault, 0),
                    let loc = unmanagedLoc.takeRetainedValue() as? String {
@@ -388,20 +478,32 @@ public class MonitorManager: ObservableObject {
                 if locationStr == "External" {
                     if let ioav = IOAVServiceCreateWithService(kCFAllocatorDefault, entry)?.takeRetainedValue() {
                         let edidName = AppleSiliconDDC.readEDIDName(service: ioav) ?? "Display \(index)"
-                        let mon = Monitor(displayIndex: index, name: edidName, avService: ioav)
-                        newMonitors.append(mon)
+                        discovered.append((index: index, name: edidName, service: ioav))
                         index += 1
                     }
                 }
-                IOObjectRelease(entry)
-                entry = IOIteratorNext(iter)
             }
-            IOObjectRelease(iter)
         }
 
-        if !newMonitors.isEmpty {
-            self.monitors = newMonitors
-            appLog("同步探测显示器完成，共检测到 \(newMonitors.count) 台外接显示器")
+        if !discovered.isEmpty {
+            var updatedMonitors: [Monitor] = []
+            for item in discovered {
+                if let existing = self.monitors.first(where: { $0.name == item.name || $0.displayIndex == item.index }) {
+                    existing.updateAVService(item.service)
+                    updatedMonitors.append(existing)
+                } else {
+                    let mon = Monitor(displayIndex: item.index, name: item.name, avService: item.service)
+                    updatedMonitors.append(mon)
+                }
+            }
+            if Thread.isMainThread {
+                self.monitors = updatedMonitors
+            } else {
+                DispatchQueue.main.sync {
+                    self.monitors = updatedMonitors
+                }
+            }
+            appLog("同步探测显示器完成，共检测到 \(updatedMonitors.count) 台外接显示器")
         }
     }
 
