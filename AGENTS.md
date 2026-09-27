@@ -29,6 +29,7 @@
 
 ## 架构要点（改代码前必读）
 
+### Windows 端
 - **性能关键**：`GetCapabilitiesStringLength` 实测约 1.5 秒（DDC/CI I2C 慢速事务）。Capabilities 结果按 `设备名|描述` 缓存在 `g_capsCache`（进程生命周期，`WM_DISPLAYCHANGE` 时清空）。任何高频路径（菜单点击、tooltip 定时器）只允许调 `GetVCPFeatureAndVCPFeatureReply(0x60)`（约 60ms），禁止重复读 caps。
 - **快速路径**：托盘已常驻时再次运行 exe，只做 `FindWindowW` + `PostMessageW(KVMSwitch_ShowMenu)` 后退出，不做硬件查询。不要在这条路径之前插入任何枚举/查询。
 - **单实例**：互斥量 `Local\KVMSwitch_SingleInstance_Mutex_zuoxinyu`。注意：常驻进程若卡死，会占住互斥量导致后续启动全部静默退出——诊断"图标不显示"时先查进程与托盘窗口是否存活。
@@ -36,6 +37,13 @@
 - 显示器为泰坦军团 P275MV，VCP 0x60 代码非标准：DP=16、Type-C=15、HDMI1=17（启动时检测，config.ini 别名可覆盖）。
 - 托盘图标通过全局 `g_trayNid` + `Shell_NotifyIconW(NIM_MODIFY)` 更新 tooltip/气泡，保持 `uID`/`hWnd` 字段不被覆盖。`EnsureTrayIconRegistered()` 负责自愈：15 秒定时器 tick 与 `TaskbarCreated` 时用 no-op `NIM_MODIFY` 探测图标，丢失则带全 `NIF_ICON|NIF_MESSAGE|NIF_TIP` 重新 `NIM_ADD`（重加必须重设 uFlags，`UpdateTrayTooltip` 会把它改成仅 `NIF_TIP`），持续失败写 `%TEMP%\KVMSwitch_tray.log`。
 - 配置每次菜单点击都会重新 `LoadConfig`（故意为之，支持免重启改配置）；新增配置项遵循该模式。
+
+### macOS 端
+- **Apple Silicon DDC/CI**：Apple Silicon (M1/M2/M3/M4) 无法使用传统的 `IOFramebuffer` I2C 接口；使用私有 `IOAVService`（通过 `@_silgen_name` 链接 `IOAVServiceCreateWithService`, `IOAVServiceReadI2C`, `IOAVServiceWriteI2C`）与 I/O Registry 中的 `DCPAVServiceProxy` 节点直接通信。
+- **重试机制与延时**：Apple Silicon 上的 DDC 硬件通信极不稳定，`MonitorManager.swift` 中保留了多轮重试循环与 `usleep` 延迟（10–50ms），不可随意移除。
+- **预设管理**：`PresetManager` 将预设以 JSON 形式持久化到 `UserDefaults`，以显示器名称为键。
+- **免 Xcode 约定**：macOS 端依赖 `macos/build.sh` 直接调用命令行 `swiftc` 编译打包，请勿引入 `.xcodeproj` 或 `.xcworkspace`。新增 Swift 源文件时需同步在 `build.sh` 中显式指定。
+
 
 ## 环境坑（本机）
 
