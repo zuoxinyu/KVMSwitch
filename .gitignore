@@ -28,3 +28,6 @@ KVMSwitch/
 *.ipdb
 *.res
 *.log
+
+# Diagnostic screenshots
+tools/*.png

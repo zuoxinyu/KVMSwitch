@@ -411,6 +411,12 @@ std::vector<DWORD> ParseCapabilitiesInputCodes(const std::string& caps) {
     return codes;
 }
 
+// Capabilities (支持输入源列表) 的进程级缓存。
+// GetCapabilitiesStringLength 是一次完整的 DDC/CI I2C 慢速事务, 实测约 1.5 秒,
+// 而结果只取决于显示器型号, 进程内不会变化 —— 缓存后菜单/托盘刷新只需读取当前输入源 (~60ms)。
+// 显示拓扑变化 (WM_DISPLAYCHANGE) 时清空。
+static std::map<std::wstring, std::vector<DWORD>> g_capsCache;
+
 // 显示器枚举回调
 BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC, LPRECT, LPARAM dwData) {
     auto* ctx = reinterpret_cast<MonitorContext*>(dwData);
@@ -446,12 +452,19 @@ BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC, LPRECT, LPARAM dwData) {
                     entry.currentInput = cur;
                 }
 
-                // 读取 Capabilities
-                DWORD capLen = 0;
-                if (GetCapabilitiesStringLength(hPhys, &capLen) && capLen > 0) {
-                    std::vector<char> capBuf(capLen + 2, 0);
-                    if (CapabilitiesRequestAndCapabilitiesReply(hPhys, capBuf.data(), capLen)) {
-                        entry.supportedInputs = ParseCapabilitiesInputCodes(capBuf.data());
+                // 读取 Capabilities (带缓存, 命中时完全跳过 DDC/CI 慢速事务)
+                std::wstring capsKey = entry.deviceName + L"|" + entry.description;
+                auto cacheIt = g_capsCache.find(capsKey);
+                if (cacheIt != g_capsCache.end()) {
+                    entry.supportedInputs = cacheIt->second;
+                } else {
+                    DWORD capLen = 0;
+                    if (GetCapabilitiesStringLength(hPhys, &capLen) && capLen > 0) {
+                        std::vector<char> capBuf(capLen + 2, 0);
+                        if (CapabilitiesRequestAndCapabilitiesReply(hPhys, capBuf.data(), capLen)) {
+                            entry.supportedInputs = ParseCapabilitiesInputCodes(capBuf.data());
+                            g_capsCache[capsKey] = entry.supportedInputs;
+                        }
                     }
                 }
 
@@ -485,6 +498,66 @@ void FreeMonitorContext(MonitorContext& ctx) {
 }
 
 // 托盘状态与气泡提示管理
+// 在程序目录记录注册结果和通知区位置；受限进程可能无法写入普通临时目录。
+static void LogTrayState(const char* operation, BOOL ok, DWORD error) {
+    NOTIFYICONIDENTIFIER identifier = { sizeof(identifier) };
+    identifier.hWnd = g_trayNid.hWnd;
+    identifier.uID = g_trayNid.uID;
+    RECT rect = {};
+    HRESULT rectResult = Shell_NotifyIconGetRect(&identifier, &rect);
+    wchar_t path[MAX_PATH] = {};
+    DWORD length = GetModuleFileNameW(NULL, path, MAX_PATH);
+    if (!length || length >= MAX_PATH) return;
+    wchar_t* slash = wcsrchr(path, L'\\');
+    if (!slash) return;
+    slash[1] = L'\0';
+    if (wcscat_s(path, L"KVMSwitch_tray.log") != 0) return;
+    HANDLE file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return;
+    SYSTEMTIME time;
+    GetLocalTime(&time);
+    char line[512];
+    sprintf_s(line, "%04u-%02u-%02u %02u:%02u:%02u pid=%lu %s ok=%d error=%lu hwnd=%p icon=%p flags=0x%x rectHr=0x%08lx rect=(%ld,%ld,%ld,%ld)\r\n",
+        time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
+        GetCurrentProcessId(), operation, ok, error, g_trayNid.hWnd, g_trayNid.hIcon,
+        g_trayNid.uFlags, static_cast<unsigned long>(rectResult), rect.left, rect.top, rect.right, rect.bottom);
+    DWORD written = 0;
+    WriteFile(file, line, static_cast<DWORD>(strlen(line)), &written, NULL);
+    CloseHandle(file);
+}
+
+// 托盘图标自愈: Explorer 偶发丢失图标 (进程强杀/任务栏重启/内测版任务栏 bug) 后,
+// NIM_ADD 可能静默失败且不再恢复。用 no-op NIM_MODIFY 探测图标是否仍注册,
+// 丢失则用完整 uFlags 重新 NIM_ADD; 结果记录到程序旁的 KVMSwitch_tray.log。
+static bool EnsureTrayIconRegistered() {
+    NOTIFYICONDATAW probe = { sizeof(probe) };
+    probe.hWnd = g_trayNid.hWnd;
+    probe.uID = g_trayNid.uID;
+    probe.uFlags = NIF_STATE;
+    probe.dwState = 0;
+    probe.dwStateMask = 0;
+    if (Shell_NotifyIconW(NIM_MODIFY, &probe)) {
+        static bool loggedProbe = false;
+        if (!loggedProbe) {
+            LogTrayState("NIM_MODIFY probe", TRUE, 0);
+            loggedProbe = true;
+        }
+        return true;
+    }
+
+    // 重新注册必须带全三个标志: uFlags 可能已被 UpdateTrayTooltip 改写成仅 NIF_TIP
+    g_trayNid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    SetLastError(ERROR_SUCCESS);
+    if (Shell_NotifyIconW(NIM_ADD, &g_trayNid)) {
+        LogTrayState("NIM_ADD", TRUE, 0);
+        return true;
+    }
+
+    DWORD err = GetLastError();
+    LogTrayState("NIM_ADD", FALSE, err);
+    return false;
+}
+
 void UpdateTrayTooltip(HWND hWnd, const AppConfig* pCfg = nullptr, DWORD forcedCurrentInput = 0) {
     if (!g_hTrayWnd || !IsWindow(g_hTrayWnd)) return;
 
@@ -857,7 +930,7 @@ static DWORD g_detectedTypeCCode = 15;
 LRESULT CALLBACK TrayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == g_wmTaskbarCreated) {
         // Explorer 重启时重新添加托盘图标
-        Shell_NotifyIconW(NIM_ADD, &g_trayNid);
+        EnsureTrayIconRegistered();
         UpdateTrayTooltip(hWnd, &g_trayCfg);
         return 0;
     }
@@ -888,6 +961,8 @@ LRESULT CALLBACK TrayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
     case WM_TIMER:
         if (wParam == TIMER_ID_REFRESH) {
+            // 每次刷新前自检图标是否还在 (Explorer 偶发吞图标)
+            EnsureTrayIconRegistered();
             UpdateTrayTooltip(hWnd, &g_trayCfg);
         }
         return 0;
@@ -895,6 +970,11 @@ LRESULT CALLBACK TrayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     case WM_POWERBROADCAST:
         UpdateTrayTooltip(hWnd, &g_trayCfg);
         return TRUE;
+
+    case WM_DISPLAYCHANGE:
+        // 分辨率/显示器拓扑变化, capabilities 缓存可能不再对应实际接管的显示器
+        g_capsCache.clear();
+        break;
 
     case WM_DESTROY:
         KillTimer(hWnd, TIMER_ID_REFRESH);
@@ -938,7 +1018,10 @@ int RunTrayApp(HINSTANCE hInstance, const AppConfig& cfg, DWORD detectedTypeCCod
         g_trayNid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
     }
     wcscpy_s(g_trayNid.szTip, L"KVMSwitch - 显示器输入切换");
-    Shell_NotifyIconW(NIM_ADD, &g_trayNid);
+    if (!EnsureTrayIconRegistered()) {
+        // 首次注册失败不放弃: 定时器会持续重试
+        OutputDebugStringW(L"KVMSwitch: initial tray icon registration failed\n");
+    }
 
     UpdateTrayTooltip(g_hTrayWnd, &g_trayCfg);
 
@@ -1097,6 +1180,26 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         return 0;
     }
 
+    // 快速路径: 托盘已常驻且本次运行只是要唤起它的菜单时, 跳过耗时的显示器枚举直接转发
+    // (完整枚举首次约 1.7 秒, 由常驻进程用它自己的缓存完成, 新进程立即退出)
+    std::wstring cfgPath = GetConfigPath();
+    {
+        wchar_t modeBuf[16] = { 0 };
+        GetPrivateProfileStringW(L"General", L"mode", L"tray", modeBuf, 16, cfgPath.c_str());
+        std::wstring iniMode = ToUpper(Trim(modeBuf));
+
+        bool wakeRequest = (trimmedCmd == L"--TRAY" || trimmedCmd == L"-TRAY" || trimmedCmd == L"TRAY" ||
+            (trimmedCmd.empty() && iniMode != L"TOGGLE" && iniMode != L"MENU"));
+        if (alreadyRunning && wakeRequest) {
+            HWND hTray = FindWindowW(L"KVMSwitchTrayWindowClass", NULL);
+            if (hTray) {
+                PostMessageW(hTray, g_wmShowMenu, 0, 0);
+            }
+            if (hMutex) CloseHandle(hMutex);
+            return 0;
+        }
+    }
+
     // 枚举显示器
     MonitorContext ctx = QueryAllMonitors();
     if (ctx.monitors.empty()) {
@@ -1123,37 +1226,23 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     }
 
     // 加载配置
-    std::wstring cfgPath = GetConfigPath();
     AppConfig cfg = LoadConfig(cfgPath, detectedTypeCCode);
 
     int exitCode = 0;
 
     if (trimmedCmd == L"--TRAY" || trimmedCmd == L"-TRAY" || trimmedCmd == L"TRAY") {
-        if (alreadyRunning) {
-            HWND hTray = FindWindowW(L"KVMSwitchTrayWindowClass", NULL);
-            if (hTray) {
-                PostMessageW(hTray, g_wmShowMenu, 0, 0);
-            }
-        } else {
+        // alreadyRunning 的情况已在前面快速路径中转发并返回, 走到这里说明本进程就是首个实例
+        FreeMonitorContext(ctx);
+        exitCode = RunTrayApp(hInstance, cfg, detectedTypeCCode);
+        if (hMutex) CloseHandle(hMutex);
+        return exitCode;
+    } else if (trimmedCmd.empty()) {
+        // 无命令行参数运行
+        if (cfg.mode == L"TRAY") {
             FreeMonitorContext(ctx);
             exitCode = RunTrayApp(hInstance, cfg, detectedTypeCCode);
             if (hMutex) CloseHandle(hMutex);
             return exitCode;
-        }
-    } else if (trimmedCmd.empty()) {
-        // 无命令行参数运行
-        if (cfg.mode == L"TRAY") {
-            if (alreadyRunning) {
-                HWND hTray = FindWindowW(L"KVMSwitchTrayWindowClass", NULL);
-                if (hTray) {
-                    PostMessageW(hTray, g_wmShowMenu, 0, 0);
-                }
-            } else {
-                FreeMonitorContext(ctx);
-                exitCode = RunTrayApp(hInstance, cfg, detectedTypeCCode);
-                if (hMutex) CloseHandle(hMutex);
-                return exitCode;
-            }
         } else if (cfg.mode == L"TOGGLE") {
             DoToggle(hInstance, cfg, ctx);
             if (alreadyRunning) {
