@@ -168,6 +168,69 @@ std::wstring GetConfigPath() {
     return GetExeDir() + L"\\config.ini";
 }
 
+// DPI 感知与高分辨率缩放辅助函数 (Per-Monitor v2 DPI 适配)
+#ifndef WM_DPICHANGED
+#define WM_DPICHANGED 0x02E0
+#endif
+
+inline int ScaleDpi(int val, UINT dpi) {
+    return MulDiv(val, static_cast<int>(dpi), 96);
+}
+
+UINT GetWindowDpi(HWND hWnd) {
+    HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
+    if (hUser32) {
+        typedef UINT(WINAPI* GetDpiForWindowFn)(HWND);
+        GetDpiForWindowFn pfnGetDpiForWindow = (GetDpiForWindowFn)GetProcAddress(hUser32, "GetDpiForWindow");
+        if (pfnGetDpiForWindow && hWnd && IsWindow(hWnd)) {
+            UINT dpi = pfnGetDpiForWindow(hWnd);
+            if (dpi > 0) return dpi;
+        }
+        typedef UINT(WINAPI* GetDpiForSystemFn)();
+        GetDpiForSystemFn pfnGetDpiForSystem = (GetDpiForSystemFn)GetProcAddress(hUser32, "GetDpiForSystem");
+        if (pfnGetDpiForSystem) {
+            UINT dpi = pfnGetDpiForSystem();
+            if (dpi > 0) return dpi;
+        }
+    }
+    HDC hdc = GetDC(hWnd);
+    UINT dpi = 96;
+    if (hdc) {
+        dpi = GetDeviceCaps(hdc, LOGPIXELSY);
+        ReleaseDC(hWnd, hdc);
+    }
+    return dpi > 0 ? dpi : 96;
+}
+
+UINT GetDpiForPoint(POINT pt) {
+    HMODULE hShcore = LoadLibraryW(L"shcore.dll");
+    if (hShcore) {
+        typedef HRESULT(WINAPI* GetDpiForMonitorFn)(HMONITOR, int, UINT*, UINT*);
+        GetDpiForMonitorFn pfn = (GetDpiForMonitorFn)GetProcAddress(hShcore, "GetDpiForMonitor");
+        if (pfn) {
+            HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+            UINT dpiX = 96, dpiY = 96;
+            if (SUCCEEDED(pfn(hMon, 0 /*MDT_EFFECTIVE_DPI*/, &dpiX, &dpiY)) && dpiX > 0) {
+                FreeLibrary(hShcore);
+                return dpiX;
+            }
+        }
+        FreeLibrary(hShcore);
+    }
+    return GetWindowDpi(NULL);
+}
+
+HFONT CreateDpiFont(UINT dpi, int pointSize, int weight, const wchar_t* fontFace = L"Microsoft YaHei UI") {
+    int height = -MulDiv(pointSize, static_cast<int>(dpi), 72);
+    return CreateFontW(height, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, fontFace);
+}
+
+static BOOL CALLBACK SetChildFontProc(HWND hChild, LPARAM lParam) {
+    SendMessageW(hChild, WM_SETFONT, (WPARAM)lParam, TRUE);
+    return TRUE;
+}
+
 // Windows 开机自启动管理 (注册表 HKCU\...\Run)
 const wchar_t* REG_RUN_KEY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const wchar_t* REG_APP_NAME = L"KVMSwitch";
@@ -1202,8 +1265,25 @@ struct SavePresetDialogState {
     std::wstring currentSummary;
     std::wstring resultName;
     bool confirmed = false;
+    HWND hLabel1 = NULL;
+    HWND hSummary = NULL;
+    HWND hLabel2 = NULL;
     HWND hEdit = NULL;
+    HWND hBtnOk = NULL;
+    HWND hBtnCancel = NULL;
+    HFONT hFont = NULL;
+    UINT dpi = 96;
 };
+
+static void LayoutSavePresetControls(SavePresetDialogState* pState, UINT dpi) {
+    if (!pState) return;
+    if (pState->hLabel1) SetWindowPos(pState->hLabel1, NULL, ScaleDpi(20, dpi), ScaleDpi(15, dpi), ScaleDpi(390, dpi), ScaleDpi(20, dpi), SWP_NOZORDER | SWP_NOACTIVATE);
+    if (pState->hSummary) SetWindowPos(pState->hSummary, NULL, ScaleDpi(20, dpi), ScaleDpi(38, dpi), ScaleDpi(390, dpi), ScaleDpi(50, dpi), SWP_NOZORDER | SWP_NOACTIVATE);
+    if (pState->hLabel2) SetWindowPos(pState->hLabel2, NULL, ScaleDpi(20, dpi), ScaleDpi(94, dpi), ScaleDpi(390, dpi), ScaleDpi(20, dpi), SWP_NOZORDER | SWP_NOACTIVATE);
+    if (pState->hEdit) SetWindowPos(pState->hEdit, NULL, ScaleDpi(20, dpi), ScaleDpi(118, dpi), ScaleDpi(390, dpi), ScaleDpi(26, dpi), SWP_NOZORDER | SWP_NOACTIVATE);
+    if (pState->hBtnOk) SetWindowPos(pState->hBtnOk, NULL, ScaleDpi(210, dpi), ScaleDpi(156, dpi), ScaleDpi(95, dpi), ScaleDpi(28, dpi), SWP_NOZORDER | SWP_NOACTIVATE);
+    if (pState->hBtnCancel) SetWindowPos(pState->hBtnCancel, NULL, ScaleDpi(315, dpi), ScaleDpi(156, dpi), ScaleDpi(95, dpi), ScaleDpi(28, dpi), SWP_NOZORDER | SWP_NOACTIVATE);
+}
 
 static LRESULT CALLBACK SavePresetDlgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     SavePresetDialogState* pState = reinterpret_cast<SavePresetDialogState*>(GetWindowLongPtrW(hWnd, GWLP_USERDATA));
@@ -1213,34 +1293,52 @@ static LRESULT CALLBACK SavePresetDlgProc(HWND hWnd, UINT msg, WPARAM wParam, LP
         pState = reinterpret_cast<SavePresetDialogState*>(cs->lpCreateParams);
         SetWindowLongPtrW(hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(pState));
 
-        HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        UINT dpi = GetWindowDpi(hWnd);
+        if (dpi == 0) dpi = pState->dpi ? pState->dpi : 96;
+        pState->dpi = dpi;
+        pState->hFont = CreateDpiFont(dpi, 10, FW_NORMAL);
 
-        HWND hLabel1 = CreateWindowExW(0, L"STATIC", L"当前显示器输入状态将被保存为新预设：",
-            WS_CHILD | WS_VISIBLE, 20, 15, 390, 20, hWnd, NULL, cs->hInstance, NULL);
-        SendMessageW(hLabel1, WM_SETFONT, (WPARAM)hFont, TRUE);
+        pState->hLabel1 = CreateWindowExW(0, L"STATIC", L"当前显示器输入状态将被保存为新预设：",
+            WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hWnd, NULL, cs->hInstance, NULL);
 
-        HWND hLabelSummary = CreateWindowExW(0, L"STATIC", pState->currentSummary.c_str(),
-            WS_CHILD | WS_VISIBLE, 20, 38, 390, 48, hWnd, NULL, cs->hInstance, NULL);
-        SendMessageW(hLabelSummary, WM_SETFONT, (WPARAM)hFont, TRUE);
+        pState->hSummary = CreateWindowExW(0, L"STATIC", pState->currentSummary.c_str(),
+            WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hWnd, NULL, cs->hInstance, NULL);
 
-        HWND hLabel2 = CreateWindowExW(0, L"STATIC", L"预设名称 (例如: 双屏办公、游戏娱乐):",
-            WS_CHILD | WS_VISIBLE, 20, 94, 390, 20, hWnd, NULL, cs->hInstance, NULL);
-        SendMessageW(hLabel2, WM_SETFONT, (WPARAM)hFont, TRUE);
+        pState->hLabel2 = CreateWindowExW(0, L"STATIC", L"预设名称 (例如: 双屏办公、游戏娱乐):",
+            WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hWnd, NULL, cs->hInstance, NULL);
 
         pState->hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"我的预设",
-            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 20, 118, 390, 24, hWnd, (HMENU)101, cs->hInstance, NULL);
-        SendMessageW(pState->hEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 10, 10, hWnd, (HMENU)101, cs->hInstance, NULL);
+
+        pState->hBtnOk = CreateWindowExW(0, L"BUTTON", L"保存",
+            WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 0, 0, 10, 10, hWnd, (HMENU)IDOK, cs->hInstance, NULL);
+
+        pState->hBtnCancel = CreateWindowExW(0, L"BUTTON", L"取消",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 10, 10, hWnd, (HMENU)IDCANCEL, cs->hInstance, NULL);
+
+        EnumChildWindows(hWnd, SetChildFontProc, (LPARAM)pState->hFont);
+        LayoutSavePresetControls(pState, dpi);
+
         SendMessageW(pState->hEdit, EM_SETSEL, 0, -1);
-
-        HWND hBtnOk = CreateWindowExW(0, L"BUTTON", L"保存",
-            WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 220, 156, 90, 28, hWnd, (HMENU)IDOK, cs->hInstance, NULL);
-        SendMessageW(hBtnOk, WM_SETFONT, (WPARAM)hFont, TRUE);
-
-        HWND hBtnCancel = CreateWindowExW(0, L"BUTTON", L"取消",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 320, 156, 90, 28, hWnd, (HMENU)IDCANCEL, cs->hInstance, NULL);
-        SendMessageW(hBtnCancel, WM_SETFONT, (WPARAM)hFont, TRUE);
-
         SetFocus(pState->hEdit);
+        return 0;
+    }
+    case WM_DPICHANGED: {
+        if (pState) {
+            UINT newDpi = HIWORD(wParam);
+            pState->dpi = newDpi;
+            if (pState->hFont) {
+                DeleteObject(pState->hFont);
+                pState->hFont = NULL;
+            }
+            pState->hFont = CreateDpiFont(newDpi, 10, FW_NORMAL);
+            EnumChildWindows(hWnd, SetChildFontProc, (LPARAM)pState->hFont);
+            RECT* prc = reinterpret_cast<RECT*>(lParam);
+            SetWindowPos(hWnd, NULL, prc->left, prc->top, prc->right - prc->left, prc->bottom - prc->top, SWP_NOZORDER | SWP_NOACTIVATE);
+            LayoutSavePresetControls(pState, newDpi);
+            InvalidateRect(hWnd, NULL, TRUE);
+            UpdateWindow(hWnd);
+        }
         return 0;
     }
     case WM_CTLCOLORSTATIC: {
@@ -1274,6 +1372,12 @@ static LRESULT CALLBACK SavePresetDlgProc(HWND hWnd, UINT msg, WPARAM wParam, LP
         pState->confirmed = false;
         DestroyWindow(hWnd);
         return 0;
+    case WM_DESTROY:
+        if (pState && pState->hFont) {
+            DeleteObject(pState->hFont);
+            pState->hFont = NULL;
+        }
+        return 0;
     }
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
@@ -1287,18 +1391,27 @@ std::wstring PromptSavePresetDialog(HINSTANCE hInstance, HWND hParent, const std
         wc.hInstance = hInstance;
         wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
         wc.lpszClassName = L"KVMSwitchSavePresetDlgClass";
+        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
         RegisterClassExW(&wc);
     }
 
     SavePresetDialogState state;
     state.currentSummary = summary;
 
-    int dlgW = 450;
-    int dlgH = 240;
-    int screenW = GetSystemMetrics(SM_CXSCREEN);
-    int screenH = GetSystemMetrics(SM_CYSCREEN);
-    int posX = (screenW - dlgW) / 2;
-    int posY = (screenH - dlgH) / 2;
+    POINT ptCursor = { 0, 0 };
+    GetCursorPos(&ptCursor);
+    HMONITOR hMon = MonitorFromPoint(ptCursor, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = { sizeof(mi) };
+    if (!GetMonitorInfoW(hMon, &mi)) {
+        mi.rcWork = { 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
+    }
+    UINT dpi = GetDpiForPoint(ptCursor);
+    state.dpi = dpi;
+
+    int dlgW = ScaleDpi(450, dpi);
+    int dlgH = ScaleDpi(240, dpi);
+    int posX = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - dlgW) / 2;
+    int posY = mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top - dlgH) / 2;
 
     HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, L"KVMSwitchSavePresetDlgClass",
         L"保存多显示器预设方案",
@@ -1448,6 +1561,7 @@ struct SettingsDialogState {
     int currentPresetIndex = -1;
     bool loadingPreset = false;
     bool saved = false;
+    UINT currentDpi = 96;
     HFONT hFont = NULL;
     HFONT hBoldFont = NULL;
 };
@@ -1619,9 +1733,167 @@ static void RefreshPresetListbox(SettingsDialogState* pState, int selectIndex = 
     }
 }
 
-static BOOL CALLBACK SetChildFontProc(HWND hChild, LPARAM lParam) {
-    SendMessageW(hChild, WM_SETFONT, (WPARAM)lParam, TRUE);
-    return TRUE;
+// 控件自适应 DPI 与窗口尺寸动态重排
+static void LayoutSettingsControls(SettingsDialogState* pState, UINT dpi) {
+    if (!pState || !pState->hDlg) return;
+
+    RECT rcClient;
+    GetClientRect(pState->hDlg, &rcClient);
+    int clientW = rcClient.right - rcClient.left;
+    int clientH = rcClient.bottom - rcClient.top;
+
+    int padX = ScaleDpi(12, dpi);
+    int padY = ScaleDpi(10, dpi);
+    int bottomBarH = ScaleDpi(42, dpi);
+    int btnH = ScaleDpi(28, dpi);
+    int editH = ScaleDpi(24, dpi);
+    int btnW = ScaleDpi(85, dpi);
+
+    // 1. Tab Control
+    int tabW = clientW - padX * 2;
+    int tabH = clientH - padY - bottomBarH - ScaleDpi(6, dpi);
+    if (pState->hTab) {
+        SetWindowPos(pState->hTab, NULL, padX, padY, tabW, tabH, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    // Tab 0 Left: Presets listbox and toolbar buttons
+    int listX = padX + ScaleDpi(12, dpi);
+    int listY = padY + ScaleDpi(36, dpi);
+    int listW = ScaleDpi(180, dpi);
+    int toolBtnW = ScaleDpi(40, dpi);
+    int toolBtnH = ScaleDpi(26, dpi);
+    int toolBtnGap = ScaleDpi(5, dpi);
+    int toolBtnY = padY + tabH - toolBtnH - ScaleDpi(14, dpi);
+    int listH = toolBtnY - listY - ScaleDpi(8, dpi);
+
+    if (pState->hPresetList) {
+        SetWindowPos(pState->hPresetList, NULL, listX, listY, listW, listH, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    if (pState->hPresetBtnAdd) {
+        SetWindowPos(pState->hPresetBtnAdd, NULL, listX, toolBtnY, toolBtnW, toolBtnH, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    if (pState->hPresetBtnDel) {
+        SetWindowPos(pState->hPresetBtnDel, NULL, listX + toolBtnW + toolBtnGap, toolBtnY, toolBtnW, toolBtnH, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    if (pState->hPresetBtnUp) {
+        SetWindowPos(pState->hPresetBtnUp, NULL, listX + (toolBtnW + toolBtnGap) * 2, toolBtnY, toolBtnW, toolBtnH, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    if (pState->hPresetBtnDown) {
+        SetWindowPos(pState->hPresetBtnDown, NULL, listX + (toolBtnW + toolBtnGap) * 3, toolBtnY, toolBtnW, toolBtnH, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    // Tab 0 Right: Preset details
+    int rightX = listX + listW + ScaleDpi(16, dpi);
+    int rightW = padX + tabW - rightX - ScaleDpi(14, dpi);
+    int nameLblW = ScaleDpi(75, dpi);
+    int nameEditX = rightX + nameLblW;
+    int nameEditW = rightW - nameLblW;
+
+    if (pState->hPresetNameLabel) {
+        SetWindowPos(pState->hPresetNameLabel, NULL, rightX, listY + ScaleDpi(3, dpi), nameLblW, editH, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    if (pState->hPresetNameEdit) {
+        SetWindowPos(pState->hPresetNameEdit, NULL, nameEditX, listY, nameEditW, editH, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    int monHeaderY = listY + editH + ScaleDpi(12, dpi);
+    if (pState->hPresetMonHeader) {
+        SetWindowPos(pState->hPresetMonHeader, NULL, rightX, monHeaderY, rightW, ScaleDpi(20, dpi), SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    int monStartY = monHeaderY + ScaleDpi(26, dpi);
+    int monRowH = ScaleDpi(34, dpi);
+    int monLblW = ScaleDpi(210, dpi);
+    int monComboW = rightW - monLblW;
+
+    for (size_t i = 0; i < pState->monCombos.size(); ++i) {
+        int rowY = monStartY + static_cast<int>(i) * monRowH;
+        if (pState->monCombos[i].hLabel) {
+            SetWindowPos(pState->monCombos[i].hLabel, NULL, rightX, rowY + ScaleDpi(3, dpi), monLblW, ScaleDpi(20, dpi), SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        if (pState->monCombos[i].hCombo) {
+            SetWindowPos(pState->monCombos[i].hCombo, NULL, rightX + monLblW, rowY, monComboW, ScaleDpi(220, dpi), SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+
+    if (pState->hPresetPlaceholder) {
+        SetWindowPos(pState->hPresetPlaceholder, NULL, rightX, listY + ScaleDpi(80, dpi), rightW, ScaleDpi(40, dpi), SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    // Tab 1: General & Commands
+    int genX = padX + ScaleDpi(16, dpi);
+    int genW = tabW - ScaleDpi(32, dpi);
+    int checkH = ScaleDpi(22, dpi);
+
+    int genY = padY + ScaleDpi(36, dpi);
+    if (pState->hGenNotifyCheck) {
+        SetWindowPos(pState->hGenNotifyCheck, NULL, genX, genY, genW, checkH, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    genY += checkH + ScaleDpi(6, dpi);
+    if (pState->hGenAutoStartCheck) {
+        SetWindowPos(pState->hGenAutoStartCheck, NULL, genX, genY, genW, checkH, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    genY += checkH + ScaleDpi(10, dpi);
+    int comboLblW = ScaleDpi(130, dpi);
+    int comboW = ScaleDpi(270, dpi);
+    if (pState->hGenModeLabel) {
+        SetWindowPos(pState->hGenModeLabel, NULL, genX, genY + ScaleDpi(2, dpi), comboLblW, ScaleDpi(20, dpi), SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    if (pState->hGenModeCombo) {
+        SetWindowPos(pState->hGenModeCombo, NULL, genX + comboLblW, genY, comboW, ScaleDpi(140, dpi), SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    genY += ScaleDpi(32, dpi);
+    if (pState->hGenTargetLabel) {
+        SetWindowPos(pState->hGenTargetLabel, NULL, genX, genY + ScaleDpi(2, dpi), comboLblW, ScaleDpi(20, dpi), SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    if (pState->hGenTargetCombo) {
+        SetWindowPos(pState->hGenTargetCombo, NULL, genX + comboLblW, genY, comboW, ScaleDpi(140, dpi), SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    genY += ScaleDpi(36, dpi);
+    if (pState->hGenCmdHeader) {
+        SetWindowPos(pState->hGenCmdHeader, NULL, genX, genY, genW, ScaleDpi(20, dpi), SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    genY += ScaleDpi(26, dpi);
+    int cmdLblW = ScaleDpi(150, dpi);
+    int cmdEditW = genW - cmdLblW;
+    int cmdRowH = ScaleDpi(30, dpi);
+
+    auto layoutCmdRow = [&](HWND hLbl, HWND hEdt, int y) {
+        if (hLbl) SetWindowPos(hLbl, NULL, genX, y + ScaleDpi(3, dpi), cmdLblW, ScaleDpi(20, dpi), SWP_NOZORDER | SWP_NOACTIVATE);
+        if (hEdt) SetWindowPos(hEdt, NULL, genX + cmdLblW, y, cmdEditW, editH, SWP_NOZORDER | SWP_NOACTIVATE);
+    };
+
+    layoutCmdRow(pState->hCmdDpLabel, pState->hCmdDpEdit, genY);
+    genY += cmdRowH;
+    layoutCmdRow(pState->hCmdTypecLabel, pState->hCmdTypecEdit, genY);
+    genY += cmdRowH;
+    layoutCmdRow(pState->hCmdHdmi1Label, pState->hCmdHdmi1Edit, genY);
+    genY += cmdRowH;
+    layoutCmdRow(pState->hCmdHdmi2Label, pState->hCmdHdmi2Edit, genY);
+
+    genY += cmdRowH + ScaleDpi(4, dpi);
+    if (pState->hGenCmdHint) {
+        SetWindowPos(pState->hGenCmdHint, NULL, genX, genY, genW, ScaleDpi(38, dpi), SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    // 4. Bottom buttons
+    int bottomY = clientH - btnH - ScaleDpi(10, dpi);
+    int openIniW = ScaleDpi(210, dpi);
+    if (pState->hBtnOpenIni) {
+        SetWindowPos(pState->hBtnOpenIni, NULL, padX, bottomY, openIniW, btnH, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    int cancelX = clientW - padX - btnW;
+    int saveX = cancelX - ScaleDpi(10, dpi) - btnW;
+    if (pState->hBtnCancel) {
+        SetWindowPos(pState->hBtnCancel, NULL, cancelX, bottomY, btnW, btnH, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    if (pState->hBtnSave) {
+        SetWindowPos(pState->hBtnSave, NULL, saveX, bottomY, btnW, btnH, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
 }
 
 // 设置窗口过程函数
@@ -1636,15 +1908,17 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
         pState->hDlg = hWnd;
         g_hSettingsDlg = hWnd;
 
-        pState->hFont = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
-        pState->hBoldFont = CreateFontW(-13, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+        UINT dpi = GetWindowDpi(hWnd);
+        if (dpi == 0) dpi = pState->currentDpi ? pState->currentDpi : 96;
+        pState->currentDpi = dpi;
+
+        pState->hFont = CreateDpiFont(dpi, 10, FW_NORMAL, L"Microsoft YaHei UI");
+        pState->hBoldFont = CreateDpiFont(dpi, 10, FW_BOLD, L"Microsoft YaHei UI");
 
         // 1. Tab Control
         pState->hTab = CreateWindowExW(0, WC_TABCONTROLW, L"",
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP,
-            12, 10, 620, 420, hWnd, (HMENU)IDC_SETTINGS_TAB, cs->hInstance, NULL);
+            0, 0, 10, 10, hWnd, (HMENU)IDC_SETTINGS_TAB, cs->hInstance, NULL);
 
         TCITEMW ti = { 0 };
         ti.mask = TCIF_TEXT;
@@ -1656,54 +1930,52 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
         // 2. Tab 0 控件
         pState->hPresetList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY,
-            24, 46, 175, 330, hWnd, (HMENU)IDC_PRESET_LIST, cs->hInstance, NULL);
+            0, 0, 10, 10, hWnd, (HMENU)IDC_PRESET_LIST, cs->hInstance, NULL);
 
         pState->hPresetBtnAdd = CreateWindowExW(0, L"BUTTON", L"➕",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-            24, 384, 40, 26, hWnd, (HMENU)IDC_PRESET_ADD, cs->hInstance, NULL);
+            0, 0, 10, 10, hWnd, (HMENU)IDC_PRESET_ADD, cs->hInstance, NULL);
 
         pState->hPresetBtnDel = CreateWindowExW(0, L"BUTTON", L"➖",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-            69, 384, 40, 26, hWnd, (HMENU)IDC_PRESET_DEL, cs->hInstance, NULL);
+            0, 0, 10, 10, hWnd, (HMENU)IDC_PRESET_DEL, cs->hInstance, NULL);
 
         pState->hPresetBtnUp = CreateWindowExW(0, L"BUTTON", L"▲",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-            114, 384, 40, 26, hWnd, (HMENU)IDC_PRESET_UP, cs->hInstance, NULL);
+            0, 0, 10, 10, hWnd, (HMENU)IDC_PRESET_UP, cs->hInstance, NULL);
 
         pState->hPresetBtnDown = CreateWindowExW(0, L"BUTTON", L"▼",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-            159, 384, 40, 26, hWnd, (HMENU)IDC_PRESET_DOWN, cs->hInstance, NULL);
+            0, 0, 10, 10, hWnd, (HMENU)IDC_PRESET_DOWN, cs->hInstance, NULL);
 
         // Tab 0 右侧
         pState->hPresetNameLabel = CreateWindowExW(0, L"STATIC", L"预设名称:",
-            WS_CHILD | WS_VISIBLE, 220, 50, 70, 20, hWnd, NULL, cs->hInstance, NULL);
+            WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hWnd, NULL, cs->hInstance, NULL);
 
         pState->hPresetNameEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | WS_TABSTOP,
-            295, 48, 325, 24, hWnd, (HMENU)IDC_PRESET_NAME_EDIT, cs->hInstance, NULL);
+            0, 0, 10, 10, hWnd, (HMENU)IDC_PRESET_NAME_EDIT, cs->hInstance, NULL);
 
         pState->hPresetMonHeader = CreateWindowExW(0, L"STATIC", L"显示器目标输入源配置:",
-            WS_CHILD | WS_VISIBLE, 220, 84, 400, 20, hWnd, NULL, cs->hInstance, NULL);
+            WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hWnd, NULL, cs->hInstance, NULL);
 
         pState->hPresetPlaceholder = CreateWindowExW(0, L"STATIC", L"从左侧列表选择或新建预设方案进行配置",
-            WS_CHILD | SS_CENTER, 220, 180, 400, 40, hWnd, NULL, cs->hInstance, NULL);
+            WS_CHILD | SS_CENTER, 0, 0, 10, 10, hWnd, NULL, cs->hInstance, NULL);
 
         // 为连接的各台外接显示器创建目标源下拉选择器
         if (pState->pCtx && !pState->pCtx->monitors.empty()) {
             for (size_t i = 0; i < pState->pCtx->monitors.size(); ++i) {
                 const auto& mon = pState->pCtx->monitors[i];
-                int yRow = 114 + static_cast<int>(i) * 36;
-
                 std::wstring desc = mon.description;
                 if (desc.length() > 22) desc = desc.substr(0, 20) + L"...";
                 std::wstring monLabelText = L"🖥️ #" + std::to_wstring(i + 1) + L" " + desc + (mon.isPrimary ? L" (主):" : L":");
 
                 HWND hMonLabel = CreateWindowExW(0, L"STATIC", monLabelText.c_str(),
-                    WS_CHILD | WS_VISIBLE, 220, yRow + 3, 210, 20, hWnd, NULL, cs->hInstance, NULL);
+                    WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hWnd, NULL, cs->hInstance, NULL);
 
                 HWND hMonCombo = CreateWindowExW(0, L"COMBOBOX", L"",
                     WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
-                    435, yRow, 185, 220, hWnd, (HMENU)(IDC_PRESET_MON_BASE + i), cs->hInstance, NULL);
+                    0, 0, 10, 10, hWnd, (HMENU)(IDC_PRESET_MON_BASE + i), cs->hInstance, NULL);
 
                 MonComboInfo info;
                 info.hLabel = hMonLabel;
@@ -1726,7 +1998,7 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
             }
         } else {
             HWND hNoMon = CreateWindowExW(0, L"STATIC", L"未检测到支持 DDC/CI 的外接显示器（请确认线缆连接并开启 DDC/CI）",
-                WS_CHILD | WS_VISIBLE, 220, 114, 400, 40, hWnd, NULL, cs->hInstance, NULL);
+                WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hWnd, NULL, cs->hInstance, NULL);
             MonComboInfo dummy;
             dummy.hLabel = hNoMon;
             pState->monCombos.push_back(dummy);
@@ -1735,18 +2007,18 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
         // 3. Tab 1 控件
         pState->hGenNotifyCheck = CreateWindowExW(0, L"BUTTON", L"切换输入源成功后弹出系统气泡通知",
             WS_CHILD | BS_AUTOCHECKBOX | WS_TABSTOP,
-            28, 48, 400, 22, hWnd, (HMENU)IDC_GENERAL_NOTIFY, cs->hInstance, NULL);
+            0, 0, 10, 10, hWnd, (HMENU)IDC_GENERAL_NOTIFY, cs->hInstance, NULL);
 
         pState->hGenAutoStartCheck = CreateWindowExW(0, L"BUTTON", L"开机自启动 (登录系统后常驻系统托盘)",
             WS_CHILD | BS_AUTOCHECKBOX | WS_TABSTOP,
-            28, 74, 400, 22, hWnd, (HMENU)IDC_GENERAL_AUTOSTART, cs->hInstance, NULL);
+            0, 0, 10, 10, hWnd, (HMENU)IDC_GENERAL_AUTOSTART, cs->hInstance, NULL);
 
         pState->hGenModeLabel = CreateWindowExW(0, L"STATIC", L"托盘运行模式:",
-            WS_CHILD, 28, 104, 130, 20, hWnd, NULL, cs->hInstance, NULL);
+            WS_CHILD, 0, 0, 10, 10, hWnd, NULL, cs->hInstance, NULL);
 
         pState->hGenModeCombo = CreateWindowExW(0, L"COMBOBOX", L"",
             WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
-            160, 102, 260, 120, hWnd, (HMENU)IDC_GENERAL_MODE, cs->hInstance, NULL);
+            0, 0, 10, 10, hWnd, (HMENU)IDC_GENERAL_MODE, cs->hInstance, NULL);
         SendMessageW(pState->hGenModeCombo, CB_ADDSTRING, 0, (LPARAM)L"常驻系统托盘 (tray) - 推荐");
         SendMessageW(pState->hGenModeCombo, CB_ADDSTRING, 0, (LPARAM)L"单次运行弹出菜单 (menu)");
         SendMessageW(pState->hGenModeCombo, CB_ADDSTRING, 0, (LPARAM)L"单次运行轮流切换 (toggle)");
@@ -1756,11 +2028,11 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
         else SendMessageW(pState->hGenModeCombo, CB_SETCURSEL, 0, 0);
 
         pState->hGenTargetLabel = CreateWindowExW(0, L"STATIC", L"默认切换目标:",
-            WS_CHILD, 28, 134, 130, 20, hWnd, NULL, cs->hInstance, NULL);
+            WS_CHILD, 0, 0, 10, 10, hWnd, NULL, cs->hInstance, NULL);
 
         pState->hGenTargetCombo = CreateWindowExW(0, L"COMBOBOX", L"",
             WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
-            160, 132, 260, 120, hWnd, (HMENU)IDC_GENERAL_TARGET, cs->hInstance, NULL);
+            0, 0, 10, 10, hWnd, (HMENU)IDC_GENERAL_TARGET, cs->hInstance, NULL);
         SendMessageW(pState->hGenTargetCombo, CB_ADDSTRING, 0, (LPARAM)L"仅切换主显示器 (primary) - 推荐");
         SendMessageW(pState->hGenTargetCombo, CB_ADDSTRING, 0, (LPARAM)L"同时切换所有外接显示器 (all)");
 
@@ -1768,34 +2040,34 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
         else SendMessageW(pState->hGenTargetCombo, CB_SETCURSEL, 0, 0);
 
         pState->hGenCmdHeader = CreateWindowExW(0, L"STATIC", L"端口联动命令 (切换至对应输入源后在后台静默执行系统命令，留空则不执行):",
-            WS_CHILD, 28, 168, 580, 20, hWnd, NULL, cs->hInstance, NULL);
+            WS_CHILD, 0, 0, 10, 10, hWnd, NULL, cs->hInstance, NULL);
 
         pState->hCmdDpLabel = CreateWindowExW(0, L"STATIC", L"DisplayPort (0x10):",
-            WS_CHILD, 28, 198, 150, 20, hWnd, NULL, cs->hInstance, NULL);
+            WS_CHILD, 0, 0, 10, 10, hWnd, NULL, cs->hInstance, NULL);
         pState->hCmdDpEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | ES_AUTOHSCROLL | WS_TABSTOP,
-            180, 196, 440, 24, hWnd, (HMENU)IDC_CMD_DP, cs->hInstance, NULL);
+            0, 0, 10, 10, hWnd, (HMENU)IDC_CMD_DP, cs->hInstance, NULL);
 
         pState->hCmdTypecLabel = CreateWindowExW(0, L"STATIC", L"USB Type-C (0x0F):",
-            WS_CHILD, 28, 230, 150, 20, hWnd, NULL, cs->hInstance, NULL);
+            WS_CHILD, 0, 0, 10, 10, hWnd, NULL, cs->hInstance, NULL);
         pState->hCmdTypecEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | ES_AUTOHSCROLL | WS_TABSTOP,
-            180, 228, 440, 24, hWnd, (HMENU)IDC_CMD_TYPEC, cs->hInstance, NULL);
+            0, 0, 10, 10, hWnd, (HMENU)IDC_CMD_TYPEC, cs->hInstance, NULL);
 
         pState->hCmdHdmi1Label = CreateWindowExW(0, L"STATIC", L"HDMI 1 (0x11):",
-            WS_CHILD, 28, 262, 150, 20, hWnd, NULL, cs->hInstance, NULL);
+            WS_CHILD, 0, 0, 10, 10, hWnd, NULL, cs->hInstance, NULL);
         pState->hCmdHdmi1Edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | ES_AUTOHSCROLL | WS_TABSTOP,
-            180, 260, 440, 24, hWnd, (HMENU)IDC_CMD_HDMI1, cs->hInstance, NULL);
+            0, 0, 10, 10, hWnd, (HMENU)IDC_CMD_HDMI1, cs->hInstance, NULL);
 
         pState->hCmdHdmi2Label = CreateWindowExW(0, L"STATIC", L"HDMI 2 (0x12):",
-            WS_CHILD, 28, 294, 150, 20, hWnd, NULL, cs->hInstance, NULL);
+            WS_CHILD, 0, 0, 10, 10, hWnd, NULL, cs->hInstance, NULL);
         pState->hCmdHdmi2Edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | ES_AUTOHSCROLL | WS_TABSTOP,
-            180, 292, 440, 24, hWnd, (HMENU)IDC_CMD_HDMI2, cs->hInstance, NULL);
+            0, 0, 10, 10, hWnd, (HMENU)IDC_CMD_HDMI2, cs->hInstance, NULL);
 
         pState->hGenCmdHint = CreateWindowExW(0, L"STATIC", L"提示：与 macOS 端快捷与联动功能对齐，支持系统命令、脚本或快捷调用（例如唤醒从机、执行 ssh/curl 等），通过后台静默异步执行。",
-            WS_CHILD, 28, 330, 590, 38, hWnd, NULL, cs->hInstance, NULL);
+            WS_CHILD, 0, 0, 10, 10, hWnd, NULL, cs->hInstance, NULL);
 
         // 初始化 Tab 1 勾选项与联动内容
         SendMessageW(pState->hGenNotifyCheck, BM_SETCHECK, pState->tempConfig.notify ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -1822,20 +2094,24 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
         // 4. 底部常驻按钮
         pState->hBtnOpenIni = CreateWindowExW(0, L"BUTTON", L"📂 打开配置文件 (config.ini)",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-            15, 442, 195, 28, hWnd, (HMENU)IDC_SETTINGS_BTN_OPEN_INI, cs->hInstance, NULL);
+            0, 0, 10, 10, hWnd, (HMENU)IDC_SETTINGS_BTN_OPEN_INI, cs->hInstance, NULL);
 
         pState->hBtnSave = CreateWindowExW(0, L"BUTTON", L"保存",
             WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_TABSTOP,
-            440, 442, 90, 28, hWnd, (HMENU)IDOK, cs->hInstance, NULL);
+            0, 0, 10, 10, hWnd, (HMENU)IDOK, cs->hInstance, NULL);
 
         pState->hBtnCancel = CreateWindowExW(0, L"BUTTON", L"取消",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-            542, 442, 90, 28, hWnd, (HMENU)IDCANCEL, cs->hInstance, NULL);
+            0, 0, 10, 10, hWnd, (HMENU)IDCANCEL, cs->hInstance, NULL);
 
-        // 统一设置现代化字体
+        // 统一设置现代化高 DPI 字体
         EnumChildWindows(hWnd, SetChildFontProc, (LPARAM)pState->hFont);
+        if (pState->hTab) SendMessageW(pState->hTab, WM_SETFONT, (WPARAM)pState->hFont, TRUE);
         if (pState->hPresetMonHeader && pState->hBoldFont) SendMessageW(pState->hPresetMonHeader, WM_SETFONT, (WPARAM)pState->hBoldFont, TRUE);
         if (pState->hGenCmdHeader && pState->hBoldFont) SendMessageW(pState->hGenCmdHeader, WM_SETFONT, (WPARAM)pState->hBoldFont, TRUE);
+
+        // 执行 DPI 自适应布局
+        LayoutSettingsControls(pState, dpi);
 
         // 填充并选中预设
         RefreshPresetListbox(pState, 0);
@@ -2018,6 +2294,43 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
         break;
     }
 
+    case WM_SIZE: {
+        if (pState && pState->currentDpi > 0) {
+            LayoutSettingsControls(pState, pState->currentDpi);
+        }
+        return 0;
+    }
+
+    case WM_DPICHANGED: {
+        if (pState) {
+            UINT newDpi = HIWORD(wParam);
+            pState->currentDpi = newDpi;
+            if (pState->hFont) {
+                DeleteObject(pState->hFont);
+                pState->hFont = NULL;
+            }
+            if (pState->hBoldFont) {
+                DeleteObject(pState->hBoldFont);
+                pState->hBoldFont = NULL;
+            }
+
+            pState->hFont = CreateDpiFont(newDpi, 10, FW_NORMAL, L"Microsoft YaHei UI");
+            pState->hBoldFont = CreateDpiFont(newDpi, 10, FW_BOLD, L"Microsoft YaHei UI");
+
+            EnumChildWindows(hWnd, SetChildFontProc, (LPARAM)pState->hFont);
+            if (pState->hTab) SendMessageW(pState->hTab, WM_SETFONT, (WPARAM)pState->hFont, TRUE);
+            if (pState->hPresetMonHeader && pState->hBoldFont) SendMessageW(pState->hPresetMonHeader, WM_SETFONT, (WPARAM)pState->hBoldFont, TRUE);
+            if (pState->hGenCmdHeader && pState->hBoldFont) SendMessageW(pState->hGenCmdHeader, WM_SETFONT, (WPARAM)pState->hBoldFont, TRUE);
+
+            RECT* prc = reinterpret_cast<RECT*>(lParam);
+            SetWindowPos(hWnd, NULL, prc->left, prc->top, prc->right - prc->left, prc->bottom - prc->top, SWP_NOZORDER | SWP_NOACTIVATE);
+            LayoutSettingsControls(pState, newDpi);
+            InvalidateRect(hWnd, NULL, TRUE);
+            UpdateWindow(hWnd);
+        }
+        return 0;
+    }
+
     case WM_CLOSE:
         pState->saved = false;
         DestroyWindow(hWnd);
@@ -2025,13 +2338,15 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
 
     case WM_DESTROY:
         g_hSettingsDlg = NULL;
-        if (pState->hFont) {
-            DeleteObject(pState->hFont);
-            pState->hFont = NULL;
-        }
-        if (pState->hBoldFont) {
-            DeleteObject(pState->hBoldFont);
-            pState->hBoldFont = NULL;
+        if (pState) {
+            if (pState->hFont) {
+                DeleteObject(pState->hFont);
+                pState->hFont = NULL;
+            }
+            if (pState->hBoldFont) {
+                DeleteObject(pState->hBoldFont);
+                pState->hBoldFont = NULL;
+            }
         }
         return 0;
     }
@@ -2068,12 +2383,25 @@ bool ShowSettingsDialog(HINSTANCE hInstance, HWND hParent, AppConfig& cfg, Monit
     state.pCtx = &ctx;
     state.detectedTypeCCode = detectedTypeCCode;
 
-    int dlgW = 660;
-    int dlgH = 525;
-    int screenW = GetSystemMetrics(SM_CXSCREEN);
-    int screenH = GetSystemMetrics(SM_CYSCREEN);
-    int posX = (screenW - dlgW) / 2;
-    int posY = (screenH - dlgH) / 2;
+    POINT ptCursor = { 0, 0 };
+    GetCursorPos(&ptCursor);
+    HMONITOR hMon = MonitorFromPoint(ptCursor, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = { sizeof(mi) };
+    if (!GetMonitorInfoW(hMon, &mi)) {
+        mi.rcWork = { 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
+    }
+    UINT dpi = GetDpiForPoint(ptCursor);
+    state.currentDpi = dpi;
+
+    int dlgW = ScaleDpi(675, dpi);
+    int dlgH = ScaleDpi(540, dpi);
+    int workW = mi.rcWork.right - mi.rcWork.left;
+    int workH = mi.rcWork.bottom - mi.rcWork.top;
+    if (dlgW > workW - ScaleDpi(40, dpi)) dlgW = workW - ScaleDpi(40, dpi);
+    if (dlgH > workH - ScaleDpi(40, dpi)) dlgH = workH - ScaleDpi(40, dpi);
+
+    int posX = mi.rcWork.left + (workW - dlgW) / 2;
+    int posY = mi.rcWork.top + (workH - dlgH) / 2;
 
     HWND hWndParent = (hParent && IsWindow(hParent)) ? hParent : NULL;
 
