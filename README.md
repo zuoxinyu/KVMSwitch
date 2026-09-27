@@ -94,11 +94,13 @@ on_switch_to_dp =
 ## 编译方法
 
 ### Windows
-使用 Visual Studio 打开 `KVMSwitch.sln`，选择 `Release` 与 `x64` 进行生成；或通过命令行生成：
+使用 Visual Studio 打开 `windows/KVMSwitch.sln`，选择 `Release` 与 `x64` 进行生成；或在根目录下执行一键构建脚本（自动编译并将输出同步至根目录 `KVMSwitch.exe`）：
 
-```powershell
-MSBuild KVMSwitch.sln /p:Configuration=Release /p:Platform=x64
+```cmd
+cmd /c build_release.bat
 ```
+也可以直接在 `windows/` 目录下运行 `build.bat`。
+
 
 ### macOS (Apple Silicon)
 macOS 版本位于 `macos/` 目录，采用原生 Swift + AppKit 实现，无需庞大的 Xcode 项目文件，直接通过轻量编译脚本调用 `swiftc` 编译打包：

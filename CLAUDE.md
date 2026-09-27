@@ -4,8 +4,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build & Run
 
-## Build & Run
-
 ### macOS
 ```bash
 cd macos && bash build.sh         # compile to KVMSwitch.app
@@ -16,8 +14,11 @@ There is no Xcode project — `build.sh` invokes `swiftc` directly, linking agai
 
 ### Windows
 ```cmd
-cmd /c build_release.bat
+cmd /c build_release.bat          # compile windows/KVMSwitch.sln and auto-sync KVMSwitch.exe to repo root
+# or:
+cd windows && cmd /c build.bat    # compile inside windows/
 ```
+
 
 ## Architecture
 

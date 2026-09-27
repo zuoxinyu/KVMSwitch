@@ -22,6 +22,14 @@ cd macos
 bash build.sh
 ```
 
+### Windows
+To compile the Windows application into `KVMSwitch.exe`, run the release build script from the repository root:
+```cmd
+cmd /c build_release.bat
+```
+Or open `windows/KVMSwitch.sln` in Visual Studio and build for `x64 Release`.
+
+
 ### Run Instructions
 After building, you can launch the app directly from the terminal. As it is a Menu Bar (UI Element) application, it will not appear in the Dock. Look for the display icon in your macOS status bar.
 ```bash

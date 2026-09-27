@@ -4,13 +4,14 @@
 
 ## 结构
 
-### Windows 端
-- `KVMSwitch.cpp` — 全部应用逻辑（约 1200 行）：入口 `wWinMain`、配置、DDC/CI、托盘窗口、菜单、CLI。
-- `KVMSwitch.sln` / `KVMSwitch.vcxproj` — VS 工程，构建 x64 Release。
-- `KVMSwitch.exe`（仓库根目录）— **用户实际双击的部署副本**，构建后需手动从 `x64\Release\KVMSwitch.exe` 覆盖同步。
+### Windows 端 (`windows/`)
+- `windows/KVMSwitch.cpp` — 全部应用逻辑（约 1200 行）：入口 `wWinMain`、配置、DDC/CI、托盘窗口、菜单、CLI。
+- `windows/KVMSwitch.sln` / `KVMSwitch.vcxproj` — VS 工程，构建 x64 Release。
+- `windows/build.bat` — Windows 目录本地构建脚本。
+- `build_release.bat`（根目录）— 根目录一键构建脚本（vcvars64 + msbuild），构建成功后自动同步 `windows/x64/Release/KVMSwitch.exe` 至根目录。
+- `KVMSwitch.exe`（根目录）— **用户实际双击的部署副本**。
 - `config.ini` — 首次运行时生成在 exe 旁（便携设计）；`mode = tray | menu | toggle`。
 - `tools/` — 诊断辅助（DDC/CI 计时、窗口枚举），不属于应用本体。
-- `build_release.bat` — 命令行构建脚本（vcvars64 + msbuild）。
 
 ### macOS 端 (`macos/`)
 - `macos/build.sh` — 纯命令行构建脚本，直接调用 `swiftc` 打包生成 `KVMSwitch.app`。
@@ -22,8 +23,9 @@
 
 ## 构建
 
-- CLI：`cmd /c build_release.bat`（Git Bash 下 `cmd //c build_release.bat`）。
-- 构建后同步根目录 exe，否则用户运行的是旧版本。
+- Windows CLI：根目录运行 `cmd /c build_release.bat`（自动编译并同步生成根目录 `KVMSwitch.exe`）。
+- macOS CLI：进入 `macos/` 目录运行 `bash build.sh`。
+
 
 ## 架构要点（改代码前必读）
 
