@@ -70,10 +70,12 @@ bool ShowSettingsDialog(HINSTANCE hInstance, HWND hParent, AppConfig& cfg, Monit
 // 全局托盘相关变量
 static NOTIFYICONDATAW g_trayNid = { sizeof(NOTIFYICONDATAW) };
 static HWND g_hTrayWnd = NULL;
+static HWND g_hSettingsDlg = NULL;
 static HINSTANCE g_hInstance = NULL;
 static UINT g_wmTaskbarCreated = 0;
 static UINT g_wmShowMenu = 0;
 static UINT g_wmRefresh = 0;
+static UINT g_wmShowSettings = 0;
 
 // 数据结构
 struct PhysicalMonEntry {
@@ -1632,6 +1634,7 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
         pState = reinterpret_cast<SettingsDialogState*>(cs->lpCreateParams);
         SetWindowLongPtrW(hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(pState));
         pState->hDlg = hWnd;
+        g_hSettingsDlg = hWnd;
 
         pState->hFont = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
@@ -2021,6 +2024,7 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
         return 0;
 
     case WM_DESTROY:
+        g_hSettingsDlg = NULL;
         if (pState->hFont) {
             DeleteObject(pState->hFont);
             pState->hFont = NULL;
@@ -2037,6 +2041,16 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
 
 // 唤起图形化设置窗口
 bool ShowSettingsDialog(HINSTANCE hInstance, HWND hParent, AppConfig& cfg, MonitorContext& ctx, DWORD detectedTypeCCode) {
+    if (g_hSettingsDlg && IsWindow(g_hSettingsDlg)) {
+        ShowWindow(g_hSettingsDlg, SW_RESTORE);
+        SetForegroundWindow(g_hSettingsDlg);
+        return false;
+    }
+
+    INITCOMMONCONTROLSEX icex = { sizeof(INITCOMMONCONTROLSEX) };
+    icex.dwICC = ICC_TAB_CLASSES | ICC_STANDARD_CLASSES;
+    InitCommonControlsEx(&icex);
+
     WNDCLASSEXW wc = { sizeof(wc) };
     if (!GetClassInfoExW(hInstance, L"KVMSwitchSettingsDlgClass", &wc)) {
         wc.cbSize = sizeof(wc);
@@ -2061,14 +2075,19 @@ bool ShowSettingsDialog(HINSTANCE hInstance, HWND hParent, AppConfig& cfg, Monit
     int posX = (screenW - dlgW) / 2;
     int posY = (screenH - dlgH) / 2;
 
+    HWND hWndParent = (hParent && IsWindow(hParent)) ? hParent : NULL;
+
     HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, L"KVMSwitchSettingsDlgClass",
         L"KVMSwitch 设置",
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        posX, posY, dlgW, dlgH, hParent, NULL, hInstance, &state);
+        posX, posY, dlgW, dlgH, hWndParent, NULL, hInstance, &state);
 
     if (!hDlg) return false;
 
-    if (hParent && IsWindow(hParent)) EnableWindow(hParent, FALSE);
+    ShowWindow(hDlg, SW_SHOW);
+    UpdateWindow(hDlg);
+
+    if (hWndParent) EnableWindow(hWndParent, FALSE);
     SetForegroundWindow(hDlg);
 
     MSG msg;
@@ -2084,9 +2103,9 @@ bool ShowSettingsDialog(HINSTANCE hInstance, HWND hParent, AppConfig& cfg, Monit
         DispatchMessageW(&msg);
     }
 
-    if (hParent && IsWindow(hParent)) {
-        EnableWindow(hParent, TRUE);
-        SetForegroundWindow(hParent);
+    if (hWndParent && IsWindow(hWndParent)) {
+        EnableWindow(hWndParent, TRUE);
+        SetForegroundWindow(hWndParent);
     }
 
     if (state.saved) {
@@ -2233,7 +2252,7 @@ void ShowQuickMenu(HINSTANCE hInstance, const AppConfig& cfg, MonitorContext& ct
     // 处理菜单动作
     if (cmd == ID_ACTION_SETTINGS) {
         AppConfig latestCfg = LoadConfig(GetConfigPath(), detectedTypeCCode);
-        if (ShowSettingsDialog(hInstance, hWnd, latestCfg, ctx, detectedTypeCCode)) {
+        if (ShowSettingsDialog(hInstance, (hOwnerWnd && IsWindow(hOwnerWnd)) ? hOwnerWnd : NULL, latestCfg, ctx, detectedTypeCCode)) {
             if (g_hTrayWnd && IsWindow(g_hTrayWnd)) {
                 PostMessageW(g_hTrayWnd, g_wmRefresh, 0, 0);
             }
@@ -2342,6 +2361,13 @@ LRESULT CALLBACK TrayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         UpdateTrayTooltip(hWnd, &g_trayCfg);
         return 0;
     }
+    if (msg == g_wmShowSettings) {
+        g_trayCfg = LoadConfig(GetConfigPath(), g_detectedTypeCCode);
+        MonitorContext ctx = QueryAllMonitors();
+        ShowSettingsDialog(g_hInstance, hWnd, g_trayCfg, ctx, g_detectedTypeCCode);
+        FreeMonitorContext(ctx);
+        return 0;
+    }
 
     switch (msg) {
     case WM_CREATE:
@@ -2393,6 +2419,7 @@ int RunTrayApp(HINSTANCE hInstance, const AppConfig& cfg, DWORD detectedTypeCCod
     g_wmTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     g_wmShowMenu = RegisterWindowMessageW(L"KVMSwitch_ShowMenu");
     g_wmRefresh = RegisterWindowMessageW(L"KVMSwitch_Refresh");
+    g_wmShowSettings = RegisterWindowMessageW(L"KVMSwitch_ShowSettings");
 
     WNDCLASSEXW wc = { sizeof(wc) };
     wc.cbSize = sizeof(wc);
@@ -2547,9 +2574,15 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     // 启用 Per-Monitor 高 DPI 感知，保证菜单在高分辨率屏下清晰
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
+    // 初始化通用控件库
+    INITCOMMONCONTROLSEX icex = { sizeof(INITCOMMONCONTROLSEX) };
+    icex.dwICC = ICC_TAB_CLASSES | ICC_STANDARD_CLASSES;
+    InitCommonControlsEx(&icex);
+
     // 注册进程间通信自定义消息
     g_wmShowMenu = RegisterWindowMessageW(L"KVMSwitch_ShowMenu");
     g_wmRefresh = RegisterWindowMessageW(L"KVMSwitch_Refresh");
+    g_wmShowSettings = RegisterWindowMessageW(L"KVMSwitch_ShowSettings");
 
     // 单实例互斥量检测
     HANDLE hMutex = CreateMutexW(NULL, FALSE, L"Local\\KVMSwitch_SingleInstance_Mutex_zuoxinyu");
@@ -2601,13 +2634,23 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         return 0;
     }
 
-    // 快速路径: 托盘已常驻且本次运行只是要唤起它的菜单时, 跳过耗时的显示器枚举直接转发
+    // 快速路径: 托盘已常驻且本次运行只是要唤起它的菜单或设置窗口时, 跳过耗时的显示器枚举直接转发
     // (完整枚举首次约 1.7 秒, 由常驻进程用它自己的缓存完成, 新进程立即退出)
     std::wstring cfgPath = GetConfigPath();
     {
         wchar_t modeBuf[16] = { 0 };
         GetPrivateProfileStringW(L"General", L"mode", L"tray", modeBuf, 16, cfgPath.c_str());
         std::wstring iniMode = ToUpper(Trim(modeBuf));
+
+        bool settingsRequest = (trimmedCmd == L"--SETTINGS" || trimmedCmd == L"-S" || trimmedCmd == L"SETTINGS");
+        if (alreadyRunning && settingsRequest) {
+            HWND hTray = FindWindowW(L"KVMSwitchTrayWindowClass", NULL);
+            if (hTray) {
+                PostMessageW(hTray, g_wmShowSettings, 0, 0);
+            }
+            if (hMutex) CloseHandle(hMutex);
+            return 0;
+        }
 
         bool wakeRequest = (trimmedCmd == L"--TRAY" || trimmedCmd == L"-TRAY" || trimmedCmd == L"TRAY" ||
             (trimmedCmd.empty() && iniMode != L"TOGGLE" && iniMode != L"MENU"));
