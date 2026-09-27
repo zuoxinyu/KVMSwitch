@@ -8,15 +8,18 @@
 
 ## 核心特性
 
-- **纯原生实现**：基于 Windows 原生 `dxva2.dll` 与 VESA MCCS DDC/CI 协议开发，体积仅约 190 KB，零外部依赖，不弹黑框。
-- **常驻系统托盘 (Tray 模式)**：默认常驻 Windows 任务栏通知区域，鼠标悬浮即可查看当前激活的输入源，单击或右击随时唤出快捷切换菜单。
+- **纯原生实现**：基于 Windows 原生 `dxva2.dll` 与 VESA MCCS DDC/CI 协议开发，体积仅约 200 KB，零外部依赖，不弹黑框。
+- **常驻系统托盘 (Tray 模式)**：默认常驻 Windows 任务栏通知区域，鼠标悬浮即可查看当前激活的输入源，单击或右击随时唤出快捷切换菜单。多显示器环境下自动汇总展示各屏状态。
+- **多显示器预设方案 (Presets)**：与 macOS 端深度对齐！在多显示器场景下一键联动切换各台显示器的输入端口（例如：“办公模式”切为 1:DP, 2:TypeC；“娱乐模式”切为 1:HDMI1, 2:HDMI2）。
+- **多显示器独立子菜单**：连接多台显示器时，托盘菜单自动为每台物理显示器生成独立二级子菜单，清晰标明各自的当前输入状态及可选端口。
+- **一键保存当前状态为预设**：直接在托盘菜单点击“💾 保存当前状态为多显示器预设...”，弹出原生轻量对话框输入名称，即刻保存至配置文件。
 - **开机自启动支持**：在托盘菜单中一键勾选“开机自启动 (常驻系统托盘)”，或通过命令行快速配置，开机登录后静默常驻后台。
 - **单实例与通信机制**：已在托盘运行时再次双击不会重复创建图标，而是直接呼出切换菜单；通过快捷方式或命令行切换输入源时，常驻托盘会自动同步更新状态与悬浮提示。
 - **快捷弹出菜单 (Menu 模式)**：鼠标光标位置即刻弹出快捷选择菜单，标明当前激活的输入源，点击即可切换。
 - **一键轮换 (Toggle 模式)**：在常用输入源（如 DP ⇄ Type-C ⇄ HDMI）之间顺序轮流切换。
-- **桌面快捷方式一键生成**：内置 `--create-shortcuts` 功能，一键在桌面生成对应各输入源及托盘常驻的 `.lnk` 快捷方式，可自由设置全局热键。
-- **联动执行命令**：支持在切换到指定输入源时，在后台静默执行系统命令（例如联动唤醒睡眠中的 Mac 等）。
-- **Per-Monitor 高 DPI 感知**：完美适配 4K 及高分屏。
+- **桌面快捷方式一键生成**：内置 `--create-shortcuts` 功能，一键在桌面生成对应各输入源、所有已配置的多屏预设方案以及托盘常驻的 `.lnk` 快捷方式，可自由设置全局热键。
+- **联动执行命令**：支持在切换到指定输入源后，在后台静默执行系统命令（例如联动唤醒睡眠中的 Mac 等）。
+- **Per-Monitor 高 DPI 感知**：完美适配 4K 及多屏混合缩放。
 
 ---
 
@@ -43,13 +46,15 @@ KVMSwitch.exe hdmi1               直接切换到 HDMI 1
 KVMSwitch.exe hdmi2               直接切换到 HDMI 2
 KVMSwitch.exe typec               直接切换到 USB Type-C
 KVMSwitch.exe <数值>              直接切换到指定 VCP 60 数值 (如 15, 16, 17, 18)
+KVMSwitch.exe --preset <名称> (-p)  一键应用指定的多显示器预设方案 (如: KVMSwitch.exe -p 办公模式)
+KVMSwitch.exe --presets             列出所有已配置的多显示器预设方案及对应端口
 KVMSwitch.exe --toggle (-t)       在常用输入源之间轮换切换
 KVMSwitch.exe --menu (-m)         强制弹出快速选择菜单 (单次模式)
 KVMSwitch.exe --query (-q)        探测并显示当前所有显示器及输入源状态
 KVMSwitch.exe --autostart-enable   开启开机自启动 (常驻系统托盘)
 KVMSwitch.exe --autostart-disable  关闭开机自启动
 KVMSwitch.exe --autostart-status   查询开机自启动状态
-KVMSwitch.exe --create-shortcuts  在桌面生成一键切换快捷方式
+KVMSwitch.exe --create-shortcuts  在桌面生成一键切换快捷方式 (包含所有预设快捷方式)
 KVMSwitch.exe --help (-h)         查看帮助信息
 ```
 
@@ -87,6 +92,14 @@ on_switch_to_typec = ssh mac caffeinate -u -t 2
 on_switch_to_hdmi1 = 
 on_switch_to_hdmi2 = 
 on_switch_to_dp = 
+
+[Presets]
+; 多显示器联动预设方案 (与 macOS 端保持一致)
+; 格式: 预设名称 = 显示器标识:输入源, 显示器标识:输入源 ...
+; 显示器标识支持: 1, 2, primary, secondary, 设备名或显示器描述
+; 输入源支持: DP, HDMI1, HDMI2, TypeC 或具体数值 (15, 16, 17 等)，0 表示保持不变
+双屏办公 = 1:DP, 2:TypeC
+娱乐影音 = 1:HDMI1, 2:HDMI2
 ```
 
 ---

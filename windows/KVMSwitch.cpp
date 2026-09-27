@@ -18,6 +18,7 @@
 struct MonitorContext;
 struct AppConfig;
 void ShowQueryInfo(const MonitorContext& ctx, const AppConfig* pCfg);
+void DoToggle(HINSTANCE hInstance, const AppConfig& cfg, MonitorContext& ctx);
 
 #pragma comment(lib, "dxva2.lib")
 #pragma comment(lib, "user32.lib")
@@ -26,13 +27,17 @@ void ShowQueryInfo(const MonitorContext& ctx, const AppConfig* pCfg);
 #pragma comment(lib, "advapi32.lib")
 
 // Menu / Action IDs
-#define ID_INPUT_BASE       2000
-#define ID_ACTION_TOGGLE    3001
-#define ID_ACTION_SHORTCUTS 3002
-#define ID_ACTION_CONFIG    3003
-#define ID_ACTION_QUERY     3004
-#define ID_ACTION_EXIT      3005
-#define ID_ACTION_AUTOSTART 3006
+#define ID_INPUT_BASE          2000
+#define ID_ACTION_TOGGLE       3001
+#define ID_ACTION_SHORTCUTS    3002
+#define ID_ACTION_CONFIG       3003
+#define ID_ACTION_QUERY        3004
+#define ID_ACTION_EXIT         3005
+#define ID_ACTION_AUTOSTART    3006
+#define ID_ACTION_SAVE_PRESET  3007
+
+#define ID_PRESET_BASE         4000
+#define ID_MONITOR_INPUT_BASE  5000 // 用于多显示器独立子菜单 (monitorIdx * 100 + inputIdx)
 
 #define TIMER_ID_REFRESH    1001
 #define WM_TRAYNOTIFY       (WM_USER + 101)
@@ -68,13 +73,26 @@ struct InputItem {
     std::wstring alias;
 };
 
+// 多显示器预设目标项 (对应单个显示器的目标输入源)
+struct PresetTarget {
+    std::wstring monitorId; // "1", "2", "primary", "secondary", "\\.\DISPLAY1", 或显示器型号/描述
+    DWORD inputCode;        // 目标 VCP 60 代码 (0 表示保持不变)
+};
+
+// 多显示器预设方案 (与 macOS 端 Preset 对齐)
+struct MonitorPreset {
+    std::wstring name;
+    std::vector<PresetTarget> targets;
+};
+
 struct AppConfig {
-    std::wstring mode;          // "menu" or "toggle"
+    std::wstring mode;          // "tray", "menu" or "toggle"
     bool notify;                // 是否显示桌面切换提示
     std::wstring targetMonitor; // "primary" or "all"
     std::vector<DWORD> toggleInputs;
     std::map<std::wstring, DWORD> customInputs;
     std::map<DWORD, std::wstring> commands; // 切换后触发的命令
+    std::vector<MonitorPreset> presets;     // 多显示器预设方案列表
 };
 
 // 工具函数
@@ -267,11 +285,20 @@ void EnsureConfigFile(const std::wstring& cfgPath) {
         L"HDMI2 = 18\r\n"
         L"TypeC = 15\r\n"
         L"\r\n"
+        L"[Presets]\r\n"
+        L"; 多显示器预设方案 (与 macOS 端预设保持一致，一键联动切换所有显示器)\r\n"
+        L"; 格式: 预设名称 = 显示器标识:输入源, 显示器标识:输入源 ...\r\n"
+        L"; 显示器标识支持: 1, 2, primary, secondary, 设备名或显示器描述\r\n"
+        L"; 输入源支持: DP, HDMI1, HDMI2, TypeC 或数值代码 (15, 16, 17 等)，0 表示保持不变\r\n"
+        L"; 示例：\r\n"
+        L"; 办公模式 = 1:DP, 2:TypeC\r\n"
+        L"; 娱乐模式 = 1:HDMI1, 2:HDMI2\r\n"
+        L"\r\n"
         L"[Commands]\r\n"
         L"; 切换到指定输入源后自动在后台执行的系统命令 (可选，留空则不执行)\r\n"
         L"; 例如切换到 Mac 时唤醒 Mac，切换回 PC 时联动等:\r\n"
         L"on_switch_to_typec = ssh mac caffeinate -u -t 2\r\n"
-        L"on_switch_to_hdmi1 = ssh mac caffeinate -u -t 2\r\n"
+        L"on_switch_to_hdmi1 = \r\n"
         L"on_switch_to_hdmi2 = \r\n"
         L"on_switch_to_dp = \r\n";
 
@@ -293,48 +320,143 @@ void EnsureConfigFile(const std::wstring& cfgPath) {
     }
 }
 
+// 以正确的编码 (UTF-8/UTF-16/ANSI) 读取整个文本文件为宽字符串
+std::wstring ReadFileAsWideString(const std::wstring& filePath) {
+    HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return L"";
+
+    DWORD size = GetFileSize(hFile, NULL);
+    if (size == 0 || size == INVALID_FILE_SIZE) {
+        CloseHandle(hFile);
+        return L"";
+    }
+
+    std::vector<unsigned char> data(size);
+    DWORD read = 0;
+    ReadFile(hFile, data.data(), size, &read, NULL);
+    CloseHandle(hFile);
+
+    if (read == 0) return L"";
+
+    // 检查 UTF-16 LE BOM (FF FE)
+    if (read >= 2 && data[0] == 0xFF && data[1] == 0xFE) {
+        size_t wchars = (read - 2) / 2;
+        return std::wstring(reinterpret_cast<const wchar_t*>(data.data() + 2), wchars);
+    }
+
+    const char* utf8Data = reinterpret_cast<const char*>(data.data());
+    int utf8Len = static_cast<int>(read);
+    // 检查 UTF-8 BOM (EF BB BF)
+    if (read >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF) {
+        utf8Data += 3;
+        utf8Len -= 3;
+    }
+
+    // 优先尝试按 UTF-8 解码
+    int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8Data, utf8Len, NULL, 0);
+    if (wlen > 0) {
+        std::wstring res(wlen, 0);
+        MultiByteToWideChar(CP_UTF8, 0, utf8Data, utf8Len, &res[0], wlen);
+        return res;
+    }
+
+    // 若不是合法 UTF-8，回退到系统默认 ANSI 代码页 (如 GBK)
+    wlen = MultiByteToWideChar(CP_ACP, 0, utf8Data, utf8Len, NULL, 0);
+    if (wlen > 0) {
+        std::wstring res(wlen, 0);
+        MultiByteToWideChar(CP_ACP, 0, utf8Data, utf8Len, &res[0], wlen);
+        return res;
+    }
+
+    return L"";
+}
+
+struct IniSection {
+    std::map<std::wstring, std::wstring> entries;
+    std::vector<std::pair<std::wstring, std::wstring>> orderedEntries;
+};
+
+// 解析 INI 文件内容
+std::map<std::wstring, IniSection> ParseIniContent(const std::wstring& content) {
+    std::map<std::wstring, IniSection> sections;
+    std::wstringstream ss(content);
+    std::wstring line;
+    std::wstring curSec = L"";
+
+    while (std::getline(ss, line)) {
+        line = Trim(line);
+        if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
+
+        if (line.front() == L'[' && line.back() == L']') {
+            curSec = ToUpper(Trim(line.substr(1, line.length() - 2)));
+            continue;
+        }
+
+        size_t eq = line.find(L'=');
+        if (eq != std::wstring::npos) {
+            std::wstring key = Trim(line.substr(0, eq));
+            std::wstring val = Trim(line.substr(eq + 1));
+            sections[curSec].entries[ToUpper(key)] = val;
+            sections[curSec].orderedEntries.push_back({ key, val });
+        }
+    }
+    return sections;
+}
+
 AppConfig LoadConfig(const std::wstring& cfgPath, DWORD detectedTypeCCode = 15) {
     EnsureConfigFile(cfgPath);
 
     AppConfig cfg;
-    wchar_t buf[512] = { 0 };
+    std::wstring content = ReadFileAsWideString(cfgPath);
+    if (content.empty()) {
+        cfg.mode = L"TRAY";
+        cfg.notify = true;
+        cfg.targetMonitor = L"PRIMARY";
+        cfg.toggleInputs = { 16, 17, detectedTypeCCode };
+        return cfg;
+    }
 
-    GetPrivateProfileStringW(L"General", L"mode", L"tray", buf, 512, cfgPath.c_str());
-    cfg.mode = ToUpper(Trim(buf));
-    if (cfg.mode != L"TOGGLE" && cfg.mode != L"MENU" && cfg.mode != L"TRAY") {
+    auto sections = ParseIniContent(content);
+
+    // General 节
+    auto& gen = sections[L"GENERAL"].entries;
+    if (gen.count(L"MODE")) {
+        cfg.mode = ToUpper(gen[L"MODE"]);
+        if (cfg.mode != L"TOGGLE" && cfg.mode != L"MENU" && cfg.mode != L"TRAY") {
+            cfg.mode = L"TRAY";
+        }
+    } else {
         cfg.mode = L"TRAY";
     }
 
-    GetPrivateProfileStringW(L"General", L"notify", L"true", buf, 512, cfgPath.c_str());
-    std::wstring notifyStr = ToUpper(Trim(buf));
-    cfg.notify = (notifyStr == L"TRUE" || notifyStr == L"1" || notifyStr == L"YES");
+    if (gen.count(L"NOTIFY")) {
+        std::wstring notifyStr = ToUpper(gen[L"NOTIFY"]);
+        cfg.notify = (notifyStr == L"TRUE" || notifyStr == L"1" || notifyStr == L"YES");
+    } else {
+        cfg.notify = true;
+    }
 
-    GetPrivateProfileStringW(L"General", L"target_monitor", L"primary", buf, 512, cfgPath.c_str());
-    cfg.targetMonitor = ToUpper(Trim(buf));
+    if (gen.count(L"TARGET_MONITOR")) {
+        cfg.targetMonitor = ToUpper(gen[L"TARGET_MONITOR"]);
+    } else {
+        cfg.targetMonitor = L"PRIMARY";
+    }
 
     // Custom Inputs
-    wchar_t secBuf[2048] = { 0 };
-    if (GetPrivateProfileSectionW(L"Inputs", secBuf, 2048, cfgPath.c_str()) > 0) {
-        wchar_t* p = secBuf;
-        while (*p) {
-            std::wstring line = p;
-            size_t eq = line.find(L'=');
-            if (eq != std::wstring::npos) {
-                std::wstring key = Trim(line.substr(0, eq));
-                std::wstring val = Trim(line.substr(eq + 1));
-                try {
-                    DWORD code = (val.rfind(L"0X", 0) == 0 || val.rfind(L"0x", 0) == 0) ?
-                        std::stoul(val, nullptr, 16) : std::stoul(val);
-                    cfg.customInputs[key] = code;
-                } catch (...) {}
-            }
-            p += wcslen(p) + 1;
-        }
+    for (const auto& kv : sections[L"INPUTS"].orderedEntries) {
+        try {
+            DWORD code = (kv.second.rfind(L"0X", 0) == 0 || kv.second.rfind(L"0x", 0) == 0) ?
+                std::stoul(kv.second, nullptr, 16) : std::stoul(kv.second);
+            cfg.customInputs[kv.first] = code;
+        } catch (...) {}
     }
 
     // Toggle Inputs
-    GetPrivateProfileStringW(L"General", L"toggle_inputs", L"DP, HDMI1, TypeC", buf, 512, cfgPath.c_str());
-    std::vector<std::wstring> parts = Split(buf, L',');
+    std::wstring toggleStr = L"DP, HDMI1, TypeC";
+    if (gen.count(L"TOGGLE_INPUTS")) {
+        toggleStr = gen[L"TOGGLE_INPUTS"];
+    }
+    std::vector<std::wstring> parts = Split(toggleStr, L',');
     for (const auto& item : parts) {
         DWORD c = ParseInputAlias(item, cfg, detectedTypeCCode);
         if (c > 0 && std::find(cfg.toggleInputs.begin(), cfg.toggleInputs.end(), c) == cfg.toggleInputs.end()) {
@@ -361,21 +483,46 @@ AppConfig LoadConfig(const std::wstring& cfgPath, DWORD detectedTypeCCode = 15) 
         }
     }
 
+    auto& cmdSec = sections[L"COMMANDS"].entries;
     std::vector<std::pair<std::wstring, DWORD>> aliasMap = {
-        { L"on_switch_to_dp", dpCode },
-        { L"on_switch_to_dp1", dpCode },
-        { L"on_switch_to_typec", tcCode },
-        { L"on_switch_to_usbc", tcCode },
-        { L"on_switch_to_hdmi1", 17 },
-        { L"on_switch_to_hdmi2", 18 },
-        { L"on_switch_to_hdmi3", 19 },
+        { L"ON_SWITCH_TO_DP", dpCode },
+        { L"ON_SWITCH_TO_DP1", dpCode },
+        { L"ON_SWITCH_TO_TYPEC", tcCode },
+        { L"ON_SWITCH_TO_USBC", tcCode },
+        { L"ON_SWITCH_TO_HDMI1", 17 },
+        { L"ON_SWITCH_TO_HDMI2", 18 },
+        { L"ON_SWITCH_TO_HDMI3", 19 },
     };
-
     for (const auto& item : aliasMap) {
-        if (GetPrivateProfileStringW(L"Commands", item.first.c_str(), L"", buf, 512, cfgPath.c_str()) > 0) {
-            std::wstring cmd = Trim(buf);
-            if (!cmd.empty()) {
-                cfg.commands[item.second] = cmd;
+        if (cmdSec.count(item.first) && !cmdSec[item.first].empty()) {
+            cfg.commands[item.second] = cmdSec[item.first];
+        }
+    }
+
+    // Presets 多显示器预设解析 (保留原始中文名称和顺序)
+    for (const auto& kv : sections[L"PRESETS"].orderedEntries) {
+        std::wstring presetName = Trim(kv.first);
+        std::wstring valList = Trim(kv.second);
+        if (!presetName.empty() && !valList.empty()) {
+            MonitorPreset preset;
+            preset.name = presetName;
+            std::vector<std::wstring> entries = Split(valList, L',');
+            int autoIdx = 1;
+            for (const auto& entry : entries) {
+                size_t colon = entry.find(L':');
+                PresetTarget pt;
+                if (colon != std::wstring::npos) {
+                    pt.monitorId = Trim(entry.substr(0, colon));
+                    std::wstring codeStr = Trim(entry.substr(colon + 1));
+                    pt.inputCode = ParseInputAlias(codeStr, cfg, detectedTypeCCode);
+                } else {
+                    pt.monitorId = std::to_wstring(autoIdx++);
+                    pt.inputCode = ParseInputAlias(entry, cfg, detectedTypeCCode);
+                }
+                preset.targets.push_back(pt);
+            }
+            if (!preset.targets.empty()) {
+                cfg.presets.push_back(preset);
             }
         }
     }
@@ -561,23 +708,35 @@ static bool EnsureTrayIconRegistered() {
 void UpdateTrayTooltip(HWND hWnd, const AppConfig* pCfg = nullptr, DWORD forcedCurrentInput = 0) {
     if (!g_hTrayWnd || !IsWindow(g_hTrayWnd)) return;
 
-    DWORD curInput = forcedCurrentInput;
-    if (curInput == 0) {
+    wchar_t tip[128] = { 0 };
+    if (forcedCurrentInput != 0) {
+        std::wstring iname = GetInputName(forcedCurrentInput, pCfg);
+        swprintf_s(tip, L"KVMSwitch\n当前输入: %s (0x%02X)", iname.c_str(), forcedCurrentInput);
+    } else {
         MonitorContext ctx = QueryAllMonitors();
-        if (!ctx.monitors.empty()) {
-            const PhysicalMonEntry* pMon = nullptr;
-            for (const auto& m : ctx.monitors) {
-                if (m.isPrimary) { pMon = &m; break; }
+        if (ctx.monitors.empty()) {
+            swprintf_s(tip, L"KVMSwitch\n未检测到显示器");
+        } else if (ctx.monitors.size() == 1) {
+            DWORD cur = ctx.monitors[0].currentInput;
+            std::wstring iname = cur ? GetInputName(cur, pCfg) : L"未知";
+            swprintf_s(tip, L"KVMSwitch\n当前输入: %s (0x%02X)", iname.c_str(), cur);
+        } else {
+            // 多显示器展示: 例如 "KVMSwitch\n#1: DP\n#2: Type-C"
+            std::wstring s = L"KVMSwitch";
+            for (size_t i = 0; i < ctx.monitors.size() && i < 3; ++i) {
+                DWORD cur = ctx.monitors[i].currentInput;
+                std::wstring iname = cur ? GetInputName(cur, pCfg) : L"未知";
+                if (iname.find(L"DisplayPort") != std::wstring::npos) iname = L"DP";
+                else if (iname.find(L"USB Type-C") != std::wstring::npos) iname = L"Type-C";
+                wchar_t line[32];
+                swprintf_s(line, L"\n#%zu: %s", i + 1, iname.c_str());
+                s += line;
             }
-            if (!pMon) pMon = &ctx.monitors[0];
-            curInput = pMon->currentInput;
+            wcsncpy_s(tip, s.c_str(), _TRUNCATE);
         }
         FreeMonitorContext(ctx);
     }
 
-    std::wstring iname = curInput ? GetInputName(curInput, pCfg) : L"未知";
-    wchar_t tip[128] = { 0 };
-    swprintf_s(tip, L"KVMSwitch\n当前输入: %s (0x%02X)", iname.c_str(), curInput);
     wcscpy_s(g_trayNid.szTip, tip);
     g_trayNid.uFlags = NIF_TIP;
     Shell_NotifyIconW(NIM_MODIFY, &g_trayNid);
@@ -639,7 +798,7 @@ bool CreateDesktopShortcut(LPCWSTR szShortcutName, LPCWSTR szArgs, LPCWSTR szDes
     return SUCCEEDED(hr);
 }
 
-void CreateAllShortcuts() {
+void CreateAllShortcuts(const AppConfig* pCfg = nullptr) {
     CreateDesktopShortcut(L"切换显示器 - DP", L"dp", L"一键切换显示器至 DisplayPort 输入");
     CreateDesktopShortcut(L"切换显示器 - HDMI 1", L"hdmi1", L"一键切换显示器至 HDMI 1 输入");
     CreateDesktopShortcut(L"切换显示器 - HDMI 2", L"hdmi2", L"一键切换显示器至 HDMI 2 输入");
@@ -647,16 +806,28 @@ void CreateAllShortcuts() {
     CreateDesktopShortcut(L"切换显示器 - 轮流切换", L"--toggle", L"在常用输入源之间轮流快速切换");
     CreateDesktopShortcut(L"KVMSwitch (系统托盘常驻)", L"--tray", L"启动 KVMSwitch 并常驻系统托盘");
 
-    MessageBoxW(NULL,
-        L"已成功在桌面创建以下 6 个快捷方式：\n\n"
+    std::wstring msg = L"已成功在桌面创建以下快捷方式：\n\n"
         L"1. 切换显示器 - DP (DisplayPort)\n"
         L"2. 切换显示器 - HDMI 1\n"
         L"3. 切换显示器 - HDMI 2\n"
         L"4. 切换显示器 - Type-C\n"
         L"5. 切换显示器 - 轮流切换 (Toggle)\n"
-        L"6. KVMSwitch (系统托盘常驻)\n\n"
-        L"您可以直接在桌面双击，或将其拖动到任务栏、为快捷方式设置全局热键！",
-        L"快捷方式创建成功", MB_OK | MB_ICONINFORMATION);
+        L"6. KVMSwitch (系统托盘常驻)\n";
+
+    if (pCfg && !pCfg->presets.empty()) {
+        msg += L"\n已同时生成多显示器预设快捷方式：\n";
+        for (const auto& pr : pCfg->presets) {
+            std::wstring scName = L"预设 - " + pr.name;
+            std::wstring scArgs = L"--preset \"" + pr.name + L"\"";
+            std::wstring scDesc = L"一键应用多显示器预设方案: " + pr.name;
+            CreateDesktopShortcut(scName.c_str(), scArgs.c_str(), scDesc.c_str());
+            msg += L"• " + scName + L"\n";
+        }
+    }
+
+    msg += L"\n您可以直接在桌面双击，或将其拖动到任务栏、为快捷方式设置全局热键！";
+
+    MessageBoxW(NULL, msg.c_str(), L"快捷方式创建成功", MB_OK | MB_ICONINFORMATION);
 }
 
 // 桌面气泡提示
@@ -752,40 +923,20 @@ bool DoSwitch(HINSTANCE hInstance, DWORD targetCode, const AppConfig& cfg, Monit
 }
 
 
-// 弹出快捷菜单
-void ShowQuickMenu(HINSTANCE hInstance, const AppConfig& cfg, MonitorContext& ctx, DWORD detectedTypeCCode, HWND hOwnerWnd = NULL) {
-    UNREFERENCED_PARAMETER(hOwnerWnd);
-
-    // 确定主显示器或首个显示器
-    const PhysicalMonEntry* targetMon = nullptr;
-    for (const auto& m : ctx.monitors) {
-        if (m.isPrimary) {
-            targetMon = &m;
-            break;
-        }
-    }
-    if (!targetMon && !ctx.monitors.empty()) {
-        targetMon = &ctx.monitors[0];
-    }
-
-    DWORD curInput = targetMon ? targetMon->currentInput : 0;
-    std::wstring curName = curInput ? GetInputName(curInput, &cfg) : L"未知";
-
-    // 组织菜单项列表
-    std::vector<DWORD> inputCodes;
-    if (targetMon && !targetMon->supportedInputs.empty()) {
-        inputCodes = targetMon->supportedInputs;
+// 获取显示器支持的输入源代码列表 (带常见输入源补齐与权重排序)
+std::vector<DWORD> GetSupportedInputCodes(const PhysicalMonEntry* mon, DWORD detectedTypeCCode = 15) {
+    std::vector<DWORD> codes;
+    if (mon && !mon->supportedInputs.empty()) {
+        codes = mon->supportedInputs;
     } else {
-        inputCodes = { 16, 17, 18, detectedTypeCCode };
+        codes = { 16, 17, 18, detectedTypeCCode };
     }
 
-    // 保证 16 (DP), 17 (HDMI 1), detectedTypeCCode (Type-C) 在列表中
-    if (std::find(inputCodes.begin(), inputCodes.end(), 16) == inputCodes.end()) inputCodes.push_back(16);
-    if (std::find(inputCodes.begin(), inputCodes.end(), 17) == inputCodes.end()) inputCodes.push_back(17);
-    if (std::find(inputCodes.begin(), inputCodes.end(), detectedTypeCCode) == inputCodes.end()) inputCodes.push_back(detectedTypeCCode);
+    if (std::find(codes.begin(), codes.end(), 16) == codes.end()) codes.push_back(16);
+    if (std::find(codes.begin(), codes.end(), 17) == codes.end()) codes.push_back(17);
+    if (std::find(codes.begin(), codes.end(), detectedTypeCCode) == codes.end()) codes.push_back(detectedTypeCCode);
 
-    // 排序保证顺序友好: DP -> HDMI1 -> HDMI2 -> Type-C
-    std::sort(inputCodes.begin(), inputCodes.end(), [](DWORD a, DWORD b) {
+    std::sort(codes.begin(), codes.end(), [](DWORD a, DWORD b) {
         auto getWeight = [](DWORD c) {
             if (c == 16) return 1; // DP
             if (c == 17) return 2; // HDMI 1
@@ -795,6 +946,346 @@ void ShowQuickMenu(HINSTANCE hInstance, const AppConfig& cfg, MonitorContext& ct
         };
         return getWeight(a) < getWeight(b);
     });
+    return codes;
+}
+
+// 预设中的显示器匹配逻辑 (支持 1-based 序号、primary/secondary、设备名、型号/描述子串)
+bool MatchMonitor(const PhysicalMonEntry& mon, size_t mon1BasedIndex, const std::wstring& targetId) {
+    std::wstring id = ToUpper(Trim(targetId));
+    if (id.empty()) return false;
+
+    // 1. 编号匹配: "1", "#1"
+    if (id == std::to_wstring(mon1BasedIndex) || id == (L"#" + std::to_wstring(mon1BasedIndex))) {
+        return true;
+    }
+
+    // 2. 主副角色匹配: "PRIMARY", "MAIN", "SECONDARY"
+    if ((id == L"PRIMARY" || id == L"MAIN") && mon.isPrimary) {
+        return true;
+    }
+    if (id == L"SECONDARY" && !mon.isPrimary && mon1BasedIndex == 2) {
+        return true;
+    }
+
+    // 3. 设备名匹配: "\\.\DISPLAY1" 或 "DISPLAY1"
+    std::wstring devUpper = ToUpper(mon.deviceName);
+    if (devUpper == id || devUpper.find(id) != std::wstring::npos) {
+        return true;
+    }
+
+    // 4. 显示器型号/描述子串匹配: 例如 "P275MV"
+    std::wstring descUpper = ToUpper(mon.description);
+    if (descUpper.find(id) != std::wstring::npos) {
+        return true;
+    }
+
+    return false;
+}
+
+// 应用多显示器预设方案 (与 macOS 端 applyPreset 保持一致)
+bool ApplyPreset(HINSTANCE hInstance, const MonitorPreset& preset, const AppConfig& cfg, MonitorContext& ctx) {
+    int appliedCount = 0;
+    std::vector<std::wstring> switchLogs;
+
+    for (size_t i = 0; i < ctx.monitors.size(); ++i) {
+        const auto& mon = ctx.monitors[i];
+        size_t mon1Based = i + 1;
+
+        // 查找该显示器对应的预设目标输入源
+        DWORD targetCode = 0;
+        for (const auto& target : preset.targets) {
+            if (MatchMonitor(mon, mon1Based, target.monitorId)) {
+                targetCode = target.inputCode;
+                break;
+            }
+        }
+
+        // targetCode == 0 表示保持不变或未配置
+        if (targetCode > 0 && targetCode != mon.currentInput) {
+            if (SetMonitorInputSource(mon.hPhysicalMonitor, targetCode)) {
+                appliedCount++;
+                std::wstring iname = GetInputName(targetCode, &cfg);
+                switchLogs.push_back(L"#" + std::to_wstring(mon1Based) + L": " + iname);
+
+                // 执行关联联动命令
+                auto itCmd = cfg.commands.find(targetCode);
+                if (itCmd != cfg.commands.end()) {
+                    ExecuteCustomCommand(itCmd->second);
+                }
+            }
+        }
+    }
+
+    if (appliedCount > 0) {
+        if (cfg.notify) {
+            std::wstring msg = L"预设「" + preset.name + L"」已生效";
+            if (!switchLogs.empty()) {
+                msg += L" (";
+                for (size_t idx = 0; idx < switchLogs.size(); ++idx) {
+                    if (idx > 0) msg += L", ";
+                    msg += switchLogs[idx];
+                }
+                msg += L")";
+            }
+            if (g_hTrayWnd && IsWindow(g_hTrayWnd)) {
+                ShowTrayBalloon(L"KVMSwitch 预设切换", msg);
+            } else {
+                ShowNotification(hInstance, L"KVMSwitch 预设切换", msg);
+            }
+        }
+
+        if (g_hTrayWnd && IsWindow(g_hTrayWnd)) {
+            UpdateTrayTooltip(g_hTrayWnd, &cfg);
+        }
+        return true;
+    } else {
+        if (cfg.notify) {
+            std::wstring msg = L"预设「" + preset.name + L"」：所有显示器已处于目标状态或无变更。";
+            if (g_hTrayWnd && IsWindow(g_hTrayWnd)) {
+                ShowTrayBalloon(L"KVMSwitch 预设", msg);
+            }
+        }
+        return false;
+    }
+}
+
+// 保存预设对话框内部状态
+struct SavePresetDialogState {
+    std::wstring currentSummary;
+    std::wstring resultName;
+    bool confirmed = false;
+    HWND hEdit = NULL;
+};
+
+static LRESULT CALLBACK SavePresetDlgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    SavePresetDialogState* pState = reinterpret_cast<SavePresetDialogState*>(GetWindowLongPtrW(hWnd, GWLP_USERDATA));
+    switch (msg) {
+    case WM_CREATE: {
+        CREATESTRUCTW* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        pState = reinterpret_cast<SavePresetDialogState*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(pState));
+
+        HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+
+        HWND hLabel1 = CreateWindowExW(0, L"STATIC", L"当前显示器输入状态将被保存为新预设：",
+            WS_CHILD | WS_VISIBLE, 20, 15, 390, 20, hWnd, NULL, cs->hInstance, NULL);
+        SendMessageW(hLabel1, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        HWND hLabelSummary = CreateWindowExW(0, L"STATIC", pState->currentSummary.c_str(),
+            WS_CHILD | WS_VISIBLE, 20, 38, 390, 48, hWnd, NULL, cs->hInstance, NULL);
+        SendMessageW(hLabelSummary, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        HWND hLabel2 = CreateWindowExW(0, L"STATIC", L"预设名称 (例如: 双屏办公、游戏娱乐):",
+            WS_CHILD | WS_VISIBLE, 20, 94, 390, 20, hWnd, NULL, cs->hInstance, NULL);
+        SendMessageW(hLabel2, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        pState->hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"我的预设",
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 20, 118, 390, 24, hWnd, (HMENU)101, cs->hInstance, NULL);
+        SendMessageW(pState->hEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendMessageW(pState->hEdit, EM_SETSEL, 0, -1);
+
+        HWND hBtnOk = CreateWindowExW(0, L"BUTTON", L"保存",
+            WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 220, 156, 90, 28, hWnd, (HMENU)IDOK, cs->hInstance, NULL);
+        SendMessageW(hBtnOk, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        HWND hBtnCancel = CreateWindowExW(0, L"BUTTON", L"取消",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 320, 156, 90, 28, hWnd, (HMENU)IDCANCEL, cs->hInstance, NULL);
+        SendMessageW(hBtnCancel, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        SetFocus(pState->hEdit);
+        return 0;
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC hdcStatic = (HDC)wParam;
+        SetBkColor(hdcStatic, GetSysColor(COLOR_BTNFACE));
+        return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+    }
+    case WM_COMMAND: {
+        int id = LOWORD(wParam);
+        if (id == IDOK) {
+            wchar_t buf[256] = { 0 };
+            GetWindowTextW(pState->hEdit, buf, 256);
+            std::wstring name = Trim(buf);
+            if (name.empty()) {
+                MessageBoxW(hWnd, L"预设名称不能为空！", L"提示", MB_OK | MB_ICONWARNING);
+                SetFocus(pState->hEdit);
+                return 0;
+            }
+            pState->resultName = name;
+            pState->confirmed = true;
+            DestroyWindow(hWnd);
+            return 0;
+        } else if (id == IDCANCEL) {
+            pState->confirmed = false;
+            DestroyWindow(hWnd);
+            return 0;
+        }
+        break;
+    }
+    case WM_CLOSE:
+        pState->confirmed = false;
+        DestroyWindow(hWnd);
+        return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+// 弹出纯 Win32 模态预设保存对话框
+std::wstring PromptSavePresetDialog(HINSTANCE hInstance, HWND hParent, const std::wstring& summary) {
+    WNDCLASSEXW wc = { sizeof(wc) };
+    if (!GetClassInfoExW(hInstance, L"KVMSwitchSavePresetDlgClass", &wc)) {
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = SavePresetDlgProc;
+        wc.hInstance = hInstance;
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"KVMSwitchSavePresetDlgClass";
+        RegisterClassExW(&wc);
+    }
+
+    SavePresetDialogState state;
+    state.currentSummary = summary;
+
+    int dlgW = 450;
+    int dlgH = 240;
+    int screenW = GetSystemMetrics(SM_CXSCREEN);
+    int screenH = GetSystemMetrics(SM_CYSCREEN);
+    int posX = (screenW - dlgW) / 2;
+    int posY = (screenH - dlgH) / 2;
+
+    HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, L"KVMSwitchSavePresetDlgClass",
+        L"保存多显示器预设方案",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        posX, posY, dlgW, dlgH, hParent, NULL, hInstance, &state);
+
+    if (!hDlg) return L"";
+
+    if (hParent) EnableWindow(hParent, FALSE);
+    SetForegroundWindow(hDlg);
+
+    MSG msg;
+    while (IsWindow(hDlg) && GetMessageW(&msg, NULL, 0, 0)) {
+        if (msg.message == WM_KEYDOWN) {
+            if (msg.wParam == VK_RETURN) {
+                SendMessageW(hDlg, WM_COMMAND, IDOK, 0);
+                continue;
+            } else if (msg.wParam == VK_ESCAPE) {
+                SendMessageW(hDlg, WM_COMMAND, IDCANCEL, 0);
+                continue;
+            }
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    if (hParent) {
+        EnableWindow(hParent, TRUE);
+        SetForegroundWindow(hParent);
+    }
+
+    return state.confirmed ? state.resultName : L"";
+}
+
+// 保存当前所有物理显示器状态为新预设
+void SaveCurrentStateAsPreset(HINSTANCE hInstance, const MonitorContext& ctx, const AppConfig* pCfg, DWORD detectedTypeCCode) {
+    if (ctx.monitors.empty()) {
+        MessageBoxW(NULL, L"未检测到外接显示器，无法保存预设。", L"KVMSwitch", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    std::wstring summary;
+    std::wstring presetValStr;
+
+    for (size_t i = 0; i < ctx.monitors.size(); ++i) {
+        const auto& m = ctx.monitors[i];
+        size_t monIndex = i + 1;
+        std::wstring iname = m.currentInput ? GetInputName(m.currentInput, pCfg) : L"未知";
+
+        if (i > 0) summary += L"\n";
+        summary += L"• 显示器 #" + std::to_wstring(monIndex) + L" (" + m.description + L"): " + iname;
+
+        if (i > 0) presetValStr += L", ";
+        std::wstring aliasStr;
+        if (m.currentInput == 16) aliasStr = L"DP";
+        else if (m.currentInput == detectedTypeCCode) aliasStr = L"TypeC";
+        else if (m.currentInput == 17) aliasStr = L"HDMI1";
+        else if (m.currentInput == 18) aliasStr = L"HDMI2";
+        else aliasStr = std::to_wstring(m.currentInput);
+
+        presetValStr += std::to_wstring(monIndex) + L":" + aliasStr;
+    }
+
+    std::wstring presetName = PromptSavePresetDialog(hInstance, NULL, summary);
+    if (presetName.empty()) {
+        return;
+    }
+
+    std::wstring cfgPath = GetConfigPath();
+    EnsureConfigFile(cfgPath);
+
+    std::wstring content = ReadFileAsWideString(cfgPath);
+    std::wstring newEntry = presetName + L" = " + presetValStr;
+
+    size_t presetPos = content.find(L"[Presets]");
+    if (presetPos == std::wstring::npos) {
+        presetPos = content.find(L"[presets]");
+    }
+
+    if (presetPos != std::wstring::npos) {
+        size_t nextSecPos = content.find(L"\n[", presetPos + 9);
+        size_t secEnd = (nextSecPos != std::wstring::npos) ? nextSecPos : content.length();
+        std::wstring secText = content.substr(presetPos, secEnd - presetPos);
+
+        std::wstring keyPrefix = presetName + L" =";
+        size_t keyPos = secText.find(keyPrefix);
+        if (keyPos == std::wstring::npos) {
+            keyPrefix = presetName + L"=";
+            keyPos = secText.find(keyPrefix);
+        }
+
+        if (keyPos != std::wstring::npos) {
+            size_t absKeyPos = presetPos + keyPos;
+            size_t lineEnd = content.find(L"\n", absKeyPos);
+            if (lineEnd == std::wstring::npos) lineEnd = content.length();
+            content.replace(absKeyPos, lineEnd - absKeyPos, newEntry);
+        } else {
+            if (secEnd > 0 && content[secEnd - 1] != L'\n') {
+                content.insert(secEnd, L"\r\n" + newEntry + L"\r\n");
+            } else {
+                content.insert(secEnd, newEntry + L"\r\n");
+            }
+        }
+    } else {
+        if (!content.empty() && content.back() != L'\n') {
+            content += L"\r\n";
+        }
+        content += L"\r\n[Presets]\r\n" + newEntry + L"\r\n";
+    }
+
+    HANDLE hFile = CreateFileW(cfgPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        const unsigned char bom[] = { 0xEF, 0xBB, 0xBF };
+        DWORD written = 0;
+        WriteFile(hFile, bom, sizeof(bom), &written, NULL);
+        int len = WideCharToMultiByte(CP_UTF8, 0, content.c_str(), (int)content.length(), NULL, 0, NULL, NULL);
+        if (len > 0) {
+            std::vector<char> utf8(len);
+            WideCharToMultiByte(CP_UTF8, 0, content.c_str(), (int)content.length(), utf8.data(), len, NULL, NULL);
+            WriteFile(hFile, utf8.data(), len, &written, NULL);
+        }
+        CloseHandle(hFile);
+    }
+
+    std::wstring succMsg = L"预设「" + presetName + L"」已成功保存！\n\n配置项: " + presetValStr + L"\n您可以随时在托盘菜单中一键应用该方案。";
+    if (g_hTrayWnd && IsWindow(g_hTrayWnd)) {
+        ShowTrayBalloon(L"KVMSwitch 预设已保存", L"预设「" + presetName + L"」保存成功。");
+    } else {
+        MessageBoxW(NULL, succMsg.c_str(), L"预设已保存", MB_OK | MB_ICONINFORMATION);
+    }
+}
+
+// 弹出快捷菜单
+void ShowQuickMenu(HINSTANCE hInstance, const AppConfig& cfg, MonitorContext& ctx, DWORD detectedTypeCCode, HWND hOwnerWnd = NULL) {
+    UNREFERENCED_PARAMETER(hOwnerWnd);
 
     // 创建菜单接收窗口与菜单
     WNDCLASSEXW wc = { sizeof(wc) };
@@ -811,31 +1302,91 @@ void ShowQuickMenu(HINSTANCE hInstance, const AppConfig& cfg, MonitorContext& ct
 
     HMENU hMenu = CreatePopupMenu();
 
-    // 头部信息
-    std::wstring monDesc = targetMon ? targetMon->description : L"显示器";
-    std::wstring headerStr = L"🖥️ " + monDesc + L" [当前: " + curName + L"]";
-    AppendMenuW(hMenu, MF_STRING | MF_DISABLED, 0, headerStr.c_str());
+    // 1. 预设方案 (Presets - 与 macOS 端对齐，顶部快捷入口)
+    std::map<UINT, size_t> presetMenuIdToIdx;
+    if (!cfg.presets.empty()) {
+        AppendMenuW(hMenu, MF_STRING | MF_DISABLED, 0, L"📐 多显示器预设方案");
+        for (size_t i = 0; i < cfg.presets.size(); ++i) {
+            UINT pid = ID_PRESET_BASE + static_cast<UINT>(i);
+            presetMenuIdToIdx[pid] = i;
+            std::wstring itemText = L"   ▶ " + cfg.presets[i].name;
+            AppendMenuW(hMenu, MF_STRING, pid, itemText.c_str());
+        }
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+    }
+
+    // 2. 轮流切换 (Toggle)
+    AppendMenuW(hMenu, MF_STRING, ID_ACTION_TOGGLE, L"🔄 轮流切换输入源 (Toggle)");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
 
-    // 输入源项
-    std::map<UINT, DWORD> menuIdToCode;
-    UINT currentMenuId = ID_INPUT_BASE;
-    for (DWORD code : inputCodes) {
-        std::wstring iname = GetInputName(code, &cfg);
-        wchar_t itemText[128];
-        swprintf_s(itemText, L"   %s  (0x%02X)", iname.c_str(), code);
+    // 3. 显示器与输入源列表
+    std::map<UINT, DWORD> singleMenuIdToCode;
+    UINT singleInputBase = ID_INPUT_BASE;
 
-        UINT flags = MF_STRING;
-        if (code == curInput) {
-            flags |= MF_CHECKED;
+    struct MonInputTarget {
+        size_t monIndex;
+        DWORD code;
+    };
+    std::map<UINT, MonInputTarget> multiMenuIdToTarget;
+    UINT multiInputBase = ID_MONITOR_INPUT_BASE;
+
+    if (ctx.monitors.empty()) {
+        AppendMenuW(hMenu, MF_STRING | MF_DISABLED, 0, L"未检测到外接显示器");
+    } else if (ctx.monitors.size() == 1) {
+        // 单显示器: 直接展开输入源
+        const auto& mon = ctx.monitors[0];
+        DWORD curInput = mon.currentInput;
+        std::wstring curName = curInput ? GetInputName(curInput, &cfg) : L"未知";
+
+        std::wstring headerStr = L"🖥️ " + mon.description + L" [当前: " + curName + L"]";
+        AppendMenuW(hMenu, MF_STRING | MF_DISABLED, 0, headerStr.c_str());
+
+        std::vector<DWORD> inputCodes = GetSupportedInputCodes(&mon, detectedTypeCCode);
+        for (DWORD code : inputCodes) {
+            std::wstring iname = GetInputName(code, &cfg);
+            wchar_t itemText[128];
+            swprintf_s(itemText, L"   %s  (0x%02X)", iname.c_str(), code);
+
+            UINT flags = MF_STRING;
+            if (code == curInput) {
+                flags |= MF_CHECKED;
+            }
+            AppendMenuW(hMenu, flags, singleInputBase, itemText);
+            singleMenuIdToCode[singleInputBase] = code;
+            singleInputBase++;
         }
-        AppendMenuW(hMenu, flags, currentMenuId, itemText);
-        menuIdToCode[currentMenuId] = code;
-        currentMenuId++;
+    } else {
+        // 多显示器: 每台显示器拥有独立的子菜单 (与 macOS 保持一致)
+        for (size_t mIdx = 0; mIdx < ctx.monitors.size(); ++mIdx) {
+            const auto& mon = ctx.monitors[mIdx];
+            DWORD curInput = mon.currentInput;
+            std::wstring curName = curInput ? GetInputName(curInput, &cfg) : L"未知";
+
+            HMENU hSubMenu = CreatePopupMenu();
+            std::vector<DWORD> inputCodes = GetSupportedInputCodes(&mon, detectedTypeCCode);
+
+            for (DWORD code : inputCodes) {
+                std::wstring iname = GetInputName(code, &cfg);
+                wchar_t itemText[128];
+                swprintf_s(itemText, L"   %s  (0x%02X)", iname.c_str(), code);
+
+                UINT flags = MF_STRING;
+                if (code == curInput) {
+                    flags |= MF_CHECKED;
+                }
+                AppendMenuW(hSubMenu, flags, multiInputBase, itemText);
+                multiMenuIdToTarget[multiInputBase] = { mIdx, code };
+                multiInputBase++;
+            }
+
+            std::wstring monItemTitle = L"🖥️ #" + std::to_wstring(mIdx + 1) + L" " + mon.description +
+                (mon.isPrimary ? L" (主)" : L"") + L"  [" + curName + L"]";
+            AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hSubMenu, monItemTitle.c_str());
+        }
     }
 
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(hMenu, MF_STRING, ID_ACTION_TOGGLE, L"🔄 轮流切换到下一个输入 (Toggle)");
+    AppendMenuW(hMenu, MF_STRING, ID_ACTION_SAVE_PRESET, L"💾 保存当前状态为多显示器预设...");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_ACTION_SHORTCUTS, L"🔗 创建桌面快捷方式 (一键切换)");
     AppendMenuW(hMenu, MF_STRING, ID_ACTION_CONFIG, L"⚙️ 打开配置文件 (config.ini)");
@@ -863,20 +1414,41 @@ void ShowQuickMenu(HINSTANCE hInstance, const AppConfig& cfg, MonitorContext& ct
     DestroyWindow(hWnd);
 
     // 处理菜单动作
-    if (cmd >= ID_INPUT_BASE && cmd < currentMenuId) {
-        DWORD chosen = menuIdToCode[cmd];
-        DoSwitch(hInstance, chosen, cfg, ctx);
-    } else if (cmd == ID_ACTION_TOGGLE) {
-        // 轮换切换
-        DWORD nextCode = cfg.toggleInputs.empty() ? 15 : cfg.toggleInputs[0];
-        auto it = std::find(cfg.toggleInputs.begin(), cfg.toggleInputs.end(), curInput);
-        if (it != cfg.toggleInputs.end()) {
-            size_t idx = std::distance(cfg.toggleInputs.begin(), it);
-            nextCode = cfg.toggleInputs[(idx + 1) % cfg.toggleInputs.size()];
+    if (presetMenuIdToIdx.count(cmd)) {
+        size_t pIdx = presetMenuIdToIdx[cmd];
+        if (pIdx < cfg.presets.size()) {
+            ApplyPreset(hInstance, cfg.presets[pIdx], cfg, ctx);
         }
-        DoSwitch(hInstance, nextCode, cfg, ctx);
+    } else if (singleMenuIdToCode.count(cmd)) {
+        DWORD chosen = singleMenuIdToCode[cmd];
+        DoSwitch(hInstance, chosen, cfg, ctx);
+    } else if (multiMenuIdToTarget.count(cmd)) {
+        auto target = multiMenuIdToTarget[cmd];
+        if (target.monIndex < ctx.monitors.size()) {
+            const auto& mon = ctx.monitors[target.monIndex];
+            if (SetMonitorInputSource(mon.hPhysicalMonitor, target.code)) {
+                if (cfg.notify) {
+                    std::wstring iname = GetInputName(target.code, &cfg);
+                    std::wstring tip = L"显示器 #" + std::to_wstring(target.monIndex + 1) + L" 输入源已切换至: " + iname;
+                    if (g_hTrayWnd && IsWindow(g_hTrayWnd)) {
+                        ShowTrayBalloon(L"KVMSwitch 输入切换", tip);
+                    } else {
+                        ShowNotification(hInstance, L"KVMSwitch 输入切换", tip);
+                    }
+                }
+                if (g_hTrayWnd && IsWindow(g_hTrayWnd)) {
+                    UpdateTrayTooltip(g_hTrayWnd, &cfg);
+                }
+            } else {
+                MessageBoxW(NULL, L"切换指定显示器输入源失败！请检查 DDC/CI 设置与线缆连接。", L"KVMSwitch 错误", MB_OK | MB_ICONERROR);
+            }
+        }
+    } else if (cmd == ID_ACTION_SAVE_PRESET) {
+        SaveCurrentStateAsPreset(hInstance, ctx, &cfg, detectedTypeCCode);
+    } else if (cmd == ID_ACTION_TOGGLE) {
+        DoToggle(hInstance, cfg, ctx);
     } else if (cmd == ID_ACTION_SHORTCUTS) {
-        CreateAllShortcuts();
+        CreateAllShortcuts(&cfg);
     } else if (cmd == ID_ACTION_CONFIG) {
         std::wstring cfgPath = GetConfigPath();
         EnsureConfigFile(cfgPath);
@@ -1120,6 +1692,8 @@ void ShowHelp() {
         L"  KVMSwitch.exe hdmi2           直接切换到 HDMI 2\n"
         L"  KVMSwitch.exe typec           直接切换到 USB Type-C\n"
         L"  KVMSwitch.exe <数值>          直接切换到指定 VCP 60 数值 (如 15, 16, 17, 18)\n"
+        L"  KVMSwitch.exe --preset <名称> (-p)  一键应用指定的多显示器预设方案\n"
+        L"  KVMSwitch.exe --presets             列出所有已配置的多显示器预设方案\n"
         L"  KVMSwitch.exe --toggle (-t)   在常用输入源之间轮换切换\n"
         L"  KVMSwitch.exe --menu (-m)     强制弹出快速选择菜单 (单次模式)\n"
         L"  KVMSwitch.exe --query (-q)    检测并显示当前所有显示器及输入源状态\n"
@@ -1176,6 +1750,27 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         return 0;
     } else if (trimmedCmd == L"--HELP" || trimmedCmd == L"-H" || trimmedCmd == L"/?" || trimmedCmd == L"HELP") {
         ShowHelp();
+        if (hMutex) CloseHandle(hMutex);
+        return 0;
+    } else if (trimmedCmd == L"--PRESETS") {
+        std::wstring cfgPath = GetConfigPath();
+        AppConfig cfg = LoadConfig(cfgPath, 15);
+        if (cfg.presets.empty()) {
+            PrintOutput(L"未配置任何预设方案。您可以在 config.ini 的 [Presets] 节添加，或在托盘菜单中保存当前状态为预设。", L"KVMSwitch 预设");
+        } else {
+            std::wstringstream ss;
+            ss << L"当前共配置了 " << cfg.presets.size() << L" 个多显示器预设方案：\n\n";
+            for (size_t i = 0; i < cfg.presets.size(); ++i) {
+                const auto& pr = cfg.presets[i];
+                ss << L"[" << (i + 1) << L"] " << pr.name << L":\n";
+                for (const auto& t : pr.targets) {
+                    std::wstring iname = (t.inputCode == 0) ? L"保持不变" : GetInputName(t.inputCode, &cfg);
+                    ss << L"    显示器 " << t.monitorId << L" -> " << iname << L" (0x" << std::hex << t.inputCode << std::dec << L")\n";
+                }
+                ss << L"\n";
+            }
+            PrintOutput(ss.str(), L"KVMSwitch 预设方案列表");
+        }
         if (hMutex) CloseHandle(hMutex);
         return 0;
     }
@@ -1261,27 +1856,85 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
             if (hTray) PostMessageW(hTray, g_wmRefresh, 0, 0);
         }
     } else if (trimmedCmd == L"--CREATE-SHORTCUTS" || trimmedCmd == L"SHORTCUTS") {
-        CreateAllShortcuts();
+        CreateAllShortcuts(&cfg);
     } else if (trimmedCmd == L"--QUERY" || trimmedCmd == L"-Q" || trimmedCmd == L"QUERY") {
         ShowQueryInfo(ctx, &cfg);
     } else {
-        // 直接指定目标输入源 (例如 dp, hdmi1, hdmi2, typec, 15, 17 等)
-        std::wstring targetStr = trimmedCmd;
-        if (targetStr.rfind(L"--", 0) == 0) targetStr = targetStr.substr(2);
-        else if (targetStr.rfind(L"-", 0) == 0) targetStr = targetStr.substr(1);
-        else if (targetStr.rfind(L"/", 0) == 0) targetStr = targetStr.substr(1);
+        // 检查是否为 --preset <name> 或 -p <name>
+        bool isPresetCmd = false;
+        std::wstring presetArg;
+        if (trimmedCmd.rfind(L"--PRESET", 0) == 0 || trimmedCmd.rfind(L"-P", 0) == 0) {
+            std::wstring raw = Trim(cmdLine);
+            size_t spacePos = raw.find_first_of(L" =:\t");
+            if (spacePos != std::wstring::npos) {
+                presetArg = Trim(raw.substr(spacePos + 1));
+                if (presetArg.length() >= 2 && presetArg.front() == L'\"' && presetArg.back() == L'\"') {
+                    presetArg = presetArg.substr(1, presetArg.length() - 2);
+                }
+                isPresetCmd = true;
+            }
+        }
 
-        DWORD targetCode = ParseInputAlias(targetStr, cfg, detectedTypeCCode);
-        if (targetCode > 0) {
-            DoSwitch(hInstance, targetCode, cfg, ctx);
-            if (alreadyRunning) {
-                HWND hTray = FindWindowW(L"KVMSwitchTrayWindowClass", NULL);
-                if (hTray) PostMessageW(hTray, g_wmRefresh, 0, 0);
+        const MonitorPreset* pPresetFound = nullptr;
+        if (isPresetCmd) {
+            std::wstring targetNameUpper = ToUpper(presetArg);
+            for (const auto& pr : cfg.presets) {
+                if (ToUpper(pr.name) == targetNameUpper) {
+                    pPresetFound = &pr;
+                    break;
+                }
+            }
+            if (!pPresetFound) {
+                for (const auto& pr : cfg.presets) {
+                    if (ToUpper(pr.name).find(targetNameUpper) != std::wstring::npos) {
+                        pPresetFound = &pr;
+                        break;
+                    }
+                }
             }
         } else {
-            std::wstring err = L"无法识别的输入源参数: " + cmdLine + L"\n\n支持的参数示例: dp, hdmi1, hdmi2, typec 或数值 15, 17, 18, 16";
-            MessageBoxW(NULL, err.c_str(), L"KVMSwitch 错误", MB_OK | MB_ICONERROR);
-            exitCode = 1;
+            // 尝试直接匹配预设名称 (例如直接运行 KVMSwitch.exe 办公模式)
+            for (const auto& pr : cfg.presets) {
+                if (ToUpper(pr.name) == trimmedCmd) {
+                    pPresetFound = &pr;
+                    isPresetCmd = true;
+                    presetArg = pr.name;
+                    break;
+                }
+            }
+        }
+
+        if (isPresetCmd) {
+            if (pPresetFound) {
+                ApplyPreset(hInstance, *pPresetFound, cfg, ctx);
+                if (alreadyRunning) {
+                    HWND hTray = FindWindowW(L"KVMSwitchTrayWindowClass", NULL);
+                    if (hTray) PostMessageW(hTray, g_wmRefresh, 0, 0);
+                }
+            } else {
+                std::wstring err = L"未找到名为「" + presetArg + L"」的多显示器预设方案！\n\n请检查 config.ini 中的 [Presets] 配置，或运行 KVMSwitch.exe --presets 查看列表。";
+                PrintOutput(err, L"KVMSwitch 错误");
+                exitCode = 1;
+            }
+        } else {
+            // 直接指定目标输入源 (例如 dp, hdmi1, hdmi2, typec, 15, 17 等)
+            std::wstring targetStr = trimmedCmd;
+            if (targetStr.rfind(L"--", 0) == 0) targetStr = targetStr.substr(2);
+            else if (targetStr.rfind(L"-", 0) == 0) targetStr = targetStr.substr(1);
+            else if (targetStr.rfind(L"/", 0) == 0) targetStr = targetStr.substr(1);
+
+            DWORD targetCode = ParseInputAlias(targetStr, cfg, detectedTypeCCode);
+            if (targetCode > 0) {
+                DoSwitch(hInstance, targetCode, cfg, ctx);
+                if (alreadyRunning) {
+                    HWND hTray = FindWindowW(L"KVMSwitchTrayWindowClass", NULL);
+                    if (hTray) PostMessageW(hTray, g_wmRefresh, 0, 0);
+                }
+            } else {
+                std::wstring err = L"无法识别的输入源或预设参数: " + cmdLine + L"\n\n支持的参数示例:\n• 输入源: dp, hdmi1, hdmi2, typec, 15, 16, 17\n• 预设方案: --preset 办公模式, --presets";
+                PrintOutput(err, L"KVMSwitch 错误");
+                exitCode = 1;
+            }
         }
     }
 
