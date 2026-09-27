@@ -31,3 +31,10 @@ KVMSwitch/
 
 # Diagnostic screenshots
 tools/*.png
+
+# macOS
+.DS_Store
+macos/KVMSwitch.app/
+macos/*.app/
+macos/*.dSYM/
+

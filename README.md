@@ -93,9 +93,29 @@ on_switch_to_dp =
 
 ## 编译方法
 
+### Windows
 使用 Visual Studio 打开 `KVMSwitch.sln`，选择 `Release` 与 `x64` 进行生成；或通过命令行生成：
 
 ```powershell
 MSBuild KVMSwitch.sln /p:Configuration=Release /p:Platform=x64
 ```
+
+### macOS (Apple Silicon)
+macOS 版本位于 `macos/` 目录，采用原生 Swift + AppKit 实现，无需庞大的 Xcode 项目文件，直接通过轻量编译脚本调用 `swiftc` 编译打包：
+
+```bash
+cd macos
+bash build.sh
+open KVMSwitch.app
+```
+
+---
+
+## macOS 版本特性 (`macos/`)
+
+- **Apple Silicon 原生硬件通信**：针对 M1/M2/M3/M4 芯片硬件特性，通过私有 `IOAVService` 接口与 I/O Registry 中的 `DCPAVServiceProxy` 节点直接通信，实现毫秒级硬件 DDC/CI 读写，彻底摆脱传统 `IOFramebuffer` 失效的问题。
+- **状态栏原生集成**：基于 AppKit `NSStatusItem` 打造，启动后优雅常驻顶部状态栏。
+- **点击自动硬件刷新**：每次点击状态栏图标时，底层自动同步从物理显示器读取 VCP 0x60 最新状态并刷新对勾，保证状态实时精准。
+- **极简矢量硬件图标**：专属手绘 Type-C、DP、HDMI 物理端口矢量图标，完美配合 Apple SF Symbols，纯净无冗余 Emoji。
+- **跨平台一致的联动与预设**：支持一键轮换 (Toggle)、预设方案保存以及切换输入源后的系统自动化命令执行。
 

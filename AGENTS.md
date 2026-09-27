@@ -4,12 +4,21 @@
 
 ## 结构
 
+### Windows 端
 - `KVMSwitch.cpp` — 全部应用逻辑（约 1200 行）：入口 `wWinMain`、配置、DDC/CI、托盘窗口、菜单、CLI。
 - `KVMSwitch.sln` / `KVMSwitch.vcxproj` — VS 工程，构建 x64 Release。
 - `KVMSwitch.exe`（仓库根目录）— **用户实际双击的部署副本**，构建后需手动从 `x64\Release\KVMSwitch.exe` 覆盖同步。
 - `config.ini` — 首次运行时生成在 exe 旁（便携设计）；`mode = tray | menu | toggle`。
 - `tools/` — 诊断辅助（DDC/CI 计时、窗口枚举），不属于应用本体。
 - `build_release.bat` — 命令行构建脚本（vcvars64 + msbuild）。
+
+### macOS 端 (`macos/`)
+- `macos/build.sh` — 纯命令行构建脚本，直接调用 `swiftc` 打包生成 `KVMSwitch.app`。
+- `macos/Info.plist` — 声明 `LSUIElement = true`（Menu Bar 常驻）。
+- `macos/Sources/KVMSwitchApp.swift` — `@main` 入口，基于 AppKit `NSStatusItem` + `NSMenuDelegate` 构建，具备菜单展开自动物理状态探测与矢量图标渲染。
+- `macos/Sources/MonitorManager.swift` — 基于私有 `IOAVService` 与 `DCPAVServiceProxy` 节点的底层 DDC/CI 通信、多显示器枚举与重试控制。
+- `macos/Sources/PresetManager.swift` — 多显示器输入源预设管理与持久化。
+- `macos/Sources/SettingsView.swift` & `SettingsWindowManager.swift` — 独立设置管理窗口。
 
 ## 构建
 
