@@ -14,8 +14,11 @@ echo "Creating App Bundle Structure..."
 mkdir -p "$MAC_OS_DIR"
 mkdir -p "$RESOURCES_DIR"
 
-echo "Copying Info.plist..."
+echo "Copying Info.plist & Resources..."
 cp Info.plist "${APP_BUNDLE}/Contents/"
+if [ -f "AppIcon.icns" ]; then
+    cp AppIcon.icns "$RESOURCES_DIR/"
+fi
 
 # Locate compatible macOS SDK (preferring stable SDKs without unbundled macro plugins)
 SDK_FLAG=""

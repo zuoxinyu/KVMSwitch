@@ -114,6 +114,55 @@ private func setMenuItemImage(_ item: NSMenuItem, _ image: NSImage?) {
     }
 }
 
+enum KVMSwitchIcon {
+    /// 简化自 KVMSwitch.png 的 macOS 菜单栏图标（外接显示器轮廓 + 屏幕内部向右切换信号箭头）
+    static let statusBarIcon: NSImage = {
+        let size = NSSize(width: 18, height: 18)
+        let img = NSImage(size: size, flipped: false) { _ in
+            // 1. 显示器屏幕轮廓 (Apple 风格平滑圆角矩形)
+            let screenRect = NSRect(x: 1.5, y: 5.5, width: 15.0, height: 10.5)
+            let screen = NSBezierPath(roundedRect: screenRect, xRadius: 1.8, yRadius: 1.8)
+            screen.lineWidth = 1.3
+            screen.lineJoinStyle = .round
+            NSColor.black.setStroke()
+            screen.stroke()
+
+            // 2. 支架颈部与底座 (Stand Neck & Base)
+            let neck = NSBezierPath()
+            neck.move(to: NSPoint(x: 7.75, y: 5.5))
+            neck.line(to: NSPoint(x: 7.25, y: 3.5))
+            neck.line(to: NSPoint(x: 10.75, y: 3.5))
+            neck.line(to: NSPoint(x: 10.25, y: 5.5))
+            neck.close()
+            NSColor.black.setFill()
+            neck.fill()
+
+            let baseRect = NSRect(x: 5.25, y: 2.0, width: 7.5, height: 1.6)
+            let base = NSBezierPath(roundedRect: baseRect, xRadius: 0.8, yRadius: 0.8)
+            NSColor.black.setFill()
+            base.fill()
+
+            // 3. 屏幕内部向右切换箭头 (源自 KVMSwitch.png 品牌标识)
+            let arrow = NSBezierPath()
+            arrow.move(to: NSPoint(x: 12.8, y: 10.75))
+            arrow.line(to: NSPoint(x: 9.2, y: 13.5))
+            arrow.line(to: NSPoint(x: 9.2, y: 11.9))
+            arrow.line(to: NSPoint(x: 4.8, y: 11.9))
+            arrow.line(to: NSPoint(x: 4.8, y: 9.6))
+            arrow.line(to: NSPoint(x: 9.2, y: 9.6))
+            arrow.line(to: NSPoint(x: 9.2, y: 8.0))
+            arrow.close()
+            arrow.lineJoinStyle = .round
+            NSColor.black.setFill()
+            arrow.fill()
+
+            return true
+        }
+        img.isTemplate = true
+        return img
+    }()
+}
+
 // MARK: - AppKit AppDelegate (Native Menu Bar Item)
 
 class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -131,9 +180,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            let img = NSImage(systemSymbolName: "display", accessibilityDescription: "KVMSwitch")
-            img?.isTemplate = true
-            button.image = img
+            button.image = KVMSwitchIcon.statusBarIcon
         }
 
         menu.delegate = self
