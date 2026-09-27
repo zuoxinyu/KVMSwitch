@@ -1,12 +1,12 @@
 import SwiftUI
 import AppKit
 
-class SettingsWindowManager {
+class SettingsWindowManager: NSObject, NSWindowDelegate {
     static let shared = SettingsWindowManager()
     var window: NSWindow?
     
     func show(presetManager: PresetManager, monitorManager: MonitorManager) {
-        // 允许后台应用拥有独立活动窗口
+        // 打开设置窗口时才展示 Dock 图标并置于前台获得焦点
         NSApp.setActivationPolicy(.regular)
         
         if let win = window {
@@ -29,10 +29,18 @@ class SettingsWindowManager {
         newWindow.center()
         newWindow.contentViewController = hostingController
         newWindow.isReleasedWhenClosed = false
+        newWindow.delegate = self
         
         self.window = newWindow
         newWindow.makeKeyAndOrderFront(nil)
         newWindow.orderFrontRegardless()
         NSApp.activate(ignoringOtherApps: true)
+    }
+    
+    // 关闭设置窗口时，立即恢复为后台附属模式 (.accessory)，自动从 Dock 移除图标
+    func windowWillClose(_ notification: Notification) {
+        DispatchQueue.main.async {
+            NSApp.setActivationPolicy(.accessory)
+        }
     }
 }
