@@ -38,6 +38,7 @@
 - 托盘图标通过全局 `g_trayNid` + `Shell_NotifyIconW(NIM_MODIFY)` 更新 tooltip/气泡，保持 `uID`/`hWnd` 字段不被覆盖。`EnsureTrayIconRegistered()` 负责自愈：15 秒定时器 tick 与 `TaskbarCreated` 时用 no-op `NIM_MODIFY` 探测图标，丢失则带全 `NIF_ICON|NIF_MESSAGE|NIF_TIP` 重新 `NIM_ADD`（重加必须重设 uFlags，`UpdateTrayTooltip` 会把它改成仅 `NIF_TIP`），持续失败写 `%TEMP%\KVMSwitch_tray.log`。
 - 配置每次菜单点击都会重新 `LoadConfig`（故意为之，支持免重启改配置）；新增配置项遵循该模式。`ReadFileAsWideString` 与 `WriteFileAsUtf8WithBom` 统一处理 UTF-8（带/不带 BOM）及 UTF-16 编码，避免中文预设名称乱码。
 - **多显示器预设与子菜单**：配置 `[Presets]` 预设方案，支持显示器序号 (1, 2)、角色 (primary, secondary)、设备名或描述子串灵活匹配；连接多台显示器时自动为各显示器生成二级子菜单，并支持在托盘菜单直接保存当前各屏状态为新预设（轻量纯 Win32 模态对话框）。
+- **图形化设置面板 (Settings Dialog)**：与 macOS 端 `SettingsView` 深度对齐，纯 Win32 + Common Controls v6（`SysTabControl32`、`Microsoft YaHei UI` 字体、ClearType 渲染、`IsDialogMessageW` 键盘导航支持）。包含 Tab 0“预设方案”（预设列表、增删移序、实时重命名、物理显示器目标源 ComboBox）及 Tab 1“通用偏好与联动”（通知、自启动、运行模式、目标屏、DP/Type-C/HDMI 联动命令），支持托盘菜单 `⚙️ 设置...` 与命令行 `KVMSwitch.exe --settings (-s)` 唤出。
 
 ### macOS 端
 - **Apple Silicon DDC/CI**：Apple Silicon (M1/M2/M3/M4) 无法使用传统的 `IOFramebuffer` I2C 接口；使用私有 `IOAVService`（通过 `@_silgen_name` 链接 `IOAVServiceCreateWithService`, `IOAVServiceReadI2C`, `IOAVServiceWriteI2C`）与 I/O Registry 中的 `DCPAVServiceProxy` 节点直接通信。

@@ -15,16 +15,21 @@
 #include <algorithm>
 #include <cwctype>
 
+#include <commctrl.h>
+
 struct MonitorContext;
 struct AppConfig;
 void ShowQueryInfo(const MonitorContext& ctx, const AppConfig* pCfg);
 void DoToggle(HINSTANCE hInstance, const AppConfig& cfg, MonitorContext& ctx);
+bool ShowSettingsDialog(HINSTANCE hInstance, HWND hParent, AppConfig& cfg, MonitorContext& ctx, DWORD detectedTypeCCode);
 
 #pragma comment(lib, "dxva2.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 // Menu / Action IDs
 #define ID_INPUT_BASE          2000
@@ -35,9 +40,29 @@ void DoToggle(HINSTANCE hInstance, const AppConfig& cfg, MonitorContext& ctx);
 #define ID_ACTION_EXIT         3005
 #define ID_ACTION_AUTOSTART    3006
 #define ID_ACTION_SAVE_PRESET  3007
+#define ID_ACTION_SETTINGS     3008
 
 #define ID_PRESET_BASE         4000
 #define ID_MONITOR_INPUT_BASE  5000 // 用于多显示器独立子菜单 (monitorIdx * 100 + inputIdx)
+
+// Settings Dialog Control IDs
+#define IDC_SETTINGS_TAB           6001
+#define IDC_SETTINGS_BTN_OPEN_INI  6002
+#define IDC_PRESET_LIST            6101
+#define IDC_PRESET_ADD             6102
+#define IDC_PRESET_DEL             6103
+#define IDC_PRESET_UP              6104
+#define IDC_PRESET_DOWN            6105
+#define IDC_PRESET_NAME_EDIT       6106
+#define IDC_PRESET_MON_BASE        6200
+#define IDC_GENERAL_NOTIFY         6301
+#define IDC_GENERAL_AUTOSTART      6302
+#define IDC_GENERAL_MODE           6303
+#define IDC_GENERAL_TARGET         6304
+#define IDC_CMD_DP                 6305
+#define IDC_CMD_TYPEC              6306
+#define IDC_CMD_HDMI1              6307
+#define IDC_CMD_HDMI2              6308
 
 #define TIMER_ID_REFRESH    1001
 #define WM_TRAYNOTIFY       (WM_USER + 101)
@@ -528,6 +553,127 @@ AppConfig LoadConfig(const std::wstring& cfgPath, DWORD detectedTypeCCode = 15) 
     }
 
     return cfg;
+}
+
+// 写入 UTF-8 带 BOM 编码文本文件
+bool WriteFileAsUtf8WithBom(const std::wstring& filePath, const std::wstring& text) {
+    HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    const unsigned char bom[] = { 0xEF, 0xBB, 0xBF };
+    DWORD written = 0;
+    WriteFile(hFile, bom, sizeof(bom), &written, NULL);
+
+    int len = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.length(), NULL, 0, NULL, NULL);
+    if (len > 0) {
+        std::vector<char> utf8(len);
+        WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.length(), utf8.data(), len, NULL, NULL);
+        WriteFile(hFile, utf8.data(), len, &written, NULL);
+    }
+    CloseHandle(hFile);
+    return true;
+}
+
+std::wstring GetInputAliasForCode(DWORD code, DWORD detectedTypeCCode = 15) {
+    if (code == 16) return L"DP";
+    if (code == detectedTypeCCode) return L"TypeC";
+    if (code == 17) return L"HDMI1";
+    if (code == 18) return L"HDMI2";
+    if (code == 19) return L"HDMI3";
+    if (code == 20) return L"HDMI4";
+    return std::to_wstring(code);
+}
+
+// 将 AppConfig 保存至 INI 配置文件
+bool SaveConfigToFile(const std::wstring& cfgPath, const AppConfig& cfg, DWORD detectedTypeCCode = 15) {
+    std::wstringstream ss;
+    ss << L"; =======================================================\r\n";
+    ss << L"; KVMSwitch 显示器输入源快速切换配置文件\r\n";
+    ss << L"; =======================================================\r\n\r\n";
+
+    ss << L"[General]\r\n";
+    ss << L"; 运行模式:\r\n";
+    ss << L"; tray   - 常驻系统托盘 (推荐，随时在任务栏右下角切换、监控状态)\r\n";
+    ss << L"; menu   - 单次运行弹出快捷选择菜单后退出\r\n";
+    ss << L"; toggle - 单次运行直接在 toggle_inputs 中轮流切换后退出\r\n";
+    std::wstring modeLower = cfg.mode;
+    std::transform(modeLower.begin(), modeLower.end(), modeLower.begin(), ::towlower);
+    ss << L"mode = " << modeLower << L"\r\n\r\n";
+
+    ss << L"; 切换成功后是否显示桌面气泡通知 (true / false)\r\n";
+    ss << L"notify = " << (cfg.notify ? L"true" : L"false") << L"\r\n\r\n";
+
+    ss << L"; 目标显示器:\r\n";
+    ss << L"; primary - 仅切换主显示器 (推荐)\r\n";
+    ss << L"; all     - 同时切换所有连接的支持 DDC/CI 的显示器\r\n";
+    std::wstring targetLower = cfg.targetMonitor;
+    std::transform(targetLower.begin(), targetLower.end(), targetLower.begin(), ::towlower);
+    ss << L"target_monitor = " << targetLower << L"\r\n\r\n";
+
+    ss << L"; toggle 轮换模式下循环切换的输入源列表 (逗号分隔)\r\n";
+    ss << L"; 支持名称: DP, HDMI1, HDMI2, TypeC 或具体数值 15, 17, 18, 16\r\n";
+    ss << L"toggle_inputs = ";
+    for (size_t i = 0; i < cfg.toggleInputs.size(); ++i) {
+        if (i > 0) ss << L", ";
+        ss << GetInputAliasForCode(cfg.toggleInputs[i], detectedTypeCCode);
+    }
+    ss << L"\r\n\r\n";
+
+    ss << L"[Inputs]\r\n";
+    ss << L"; 输入源名称与 VCP 0x60 数值映射 (泰坦军团 P275MV: DP 为 16, Type-C 为 15)\r\n";
+    if (!cfg.customInputs.empty()) {
+        for (const auto& kv : cfg.customInputs) {
+            ss << kv.first << L" = " << kv.second << L"\r\n";
+        }
+    } else {
+        ss << L"DP = 16\r\nDP1 = 16\r\nHDMI1 = 17\r\nHDMI2 = 18\r\nTypeC = " << detectedTypeCCode << L"\r\n";
+    }
+    ss << L"\r\n";
+
+    ss << L"[Presets]\r\n";
+    ss << L"; 多显示器预设方案 (与 macOS 端预设保持一致，一键联动切换所有显示器)\r\n";
+    ss << L"; 格式: 预设名称 = 显示器标识:输入源, 显示器标识:输入源 ...\r\n";
+    ss << L"; 显示器标识支持: 1, 2, primary, secondary, 设备名或显示器描述\r\n";
+    ss << L"; 输入源支持: DP, HDMI1, HDMI2, TypeC 或数值代码 (15, 16, 17 等)，0 表示保持不变\r\n";
+    for (const auto& pr : cfg.presets) {
+        if (pr.name.empty()) continue;
+        ss << pr.name << L" = ";
+        for (size_t tIdx = 0; tIdx < pr.targets.size(); ++tIdx) {
+            if (tIdx > 0) ss << L", ";
+            ss << pr.targets[tIdx].monitorId << L":";
+            if (pr.targets[tIdx].inputCode == 0) {
+                ss << L"0";
+            } else {
+                ss << GetInputAliasForCode(pr.targets[tIdx].inputCode, detectedTypeCCode);
+            }
+        }
+        ss << L"\r\n";
+    }
+    ss << L"\r\n";
+
+    ss << L"[Commands]\r\n";
+    ss << L"; 切换到指定输入源后自动在后台执行的系统命令 (可选，留空则不执行)\r\n";
+    ss << L"; 例如切换到 Mac 时唤醒 Mac，切换回 PC 时联动等:\r\n";
+    DWORD dpCode = 16;
+    for (const auto& kv : cfg.customInputs) {
+        if (ToUpper(kv.first) == L"DP" || ToUpper(kv.first) == L"DP1") { dpCode = kv.second; break; }
+    }
+    DWORD tcCode = detectedTypeCCode;
+    for (const auto& kv : cfg.customInputs) {
+        if (ToUpper(kv.first) == L"TYPEC" || ToUpper(kv.first) == L"TYPE-C" || ToUpper(kv.first) == L"USBC") { tcCode = kv.second; break; }
+    }
+
+    auto getCmd = [&](DWORD code) -> std::wstring {
+        auto it = cfg.commands.find(code);
+        return (it != cfg.commands.end()) ? it->second : L"";
+    };
+
+    ss << L"on_switch_to_typec = " << getCmd(tcCode) << L"\r\n";
+    ss << L"on_switch_to_hdmi1 = " << getCmd(17) << L"\r\n";
+    ss << L"on_switch_to_hdmi2 = " << getCmd(18) << L"\r\n";
+    ss << L"on_switch_to_dp = " << getCmd(dpCode) << L"\r\n";
+
+    return WriteFileAsUtf8WithBom(cfgPath, ss.str());
 }
 
 // 解析显示器 Capabilities 字符串中的 VCP 0x60 支持项
@@ -1204,13 +1350,7 @@ void SaveCurrentStateAsPreset(HINSTANCE hInstance, const MonitorContext& ctx, co
         summary += L"• 显示器 #" + std::to_wstring(monIndex) + L" (" + m.description + L"): " + iname;
 
         if (i > 0) presetValStr += L", ";
-        std::wstring aliasStr;
-        if (m.currentInput == 16) aliasStr = L"DP";
-        else if (m.currentInput == detectedTypeCCode) aliasStr = L"TypeC";
-        else if (m.currentInput == 17) aliasStr = L"HDMI1";
-        else if (m.currentInput == 18) aliasStr = L"HDMI2";
-        else aliasStr = std::to_wstring(m.currentInput);
-
+        std::wstring aliasStr = GetInputAliasForCode(m.currentInput, detectedTypeCCode);
         presetValStr += std::to_wstring(monIndex) + L":" + aliasStr;
     }
 
@@ -1220,60 +1360,28 @@ void SaveCurrentStateAsPreset(HINSTANCE hInstance, const MonitorContext& ctx, co
     }
 
     std::wstring cfgPath = GetConfigPath();
-    EnsureConfigFile(cfgPath);
+    AppConfig updatedCfg = LoadConfig(cfgPath, detectedTypeCCode);
 
-    std::wstring content = ReadFileAsWideString(cfgPath);
-    std::wstring newEntry = presetName + L" = " + presetValStr;
-
-    size_t presetPos = content.find(L"[Presets]");
-    if (presetPos == std::wstring::npos) {
-        presetPos = content.find(L"[presets]");
+    // 检查并更新现有同名预设或追加新预设
+    MonitorPreset newPreset;
+    newPreset.name = presetName;
+    for (size_t i = 0; i < ctx.monitors.size(); ++i) {
+        newPreset.targets.push_back({ std::to_wstring(i + 1), ctx.monitors[i].currentInput });
     }
 
-    if (presetPos != std::wstring::npos) {
-        size_t nextSecPos = content.find(L"\n[", presetPos + 9);
-        size_t secEnd = (nextSecPos != std::wstring::npos) ? nextSecPos : content.length();
-        std::wstring secText = content.substr(presetPos, secEnd - presetPos);
-
-        std::wstring keyPrefix = presetName + L" =";
-        size_t keyPos = secText.find(keyPrefix);
-        if (keyPos == std::wstring::npos) {
-            keyPrefix = presetName + L"=";
-            keyPos = secText.find(keyPrefix);
+    bool found = false;
+    for (auto& pr : updatedCfg.presets) {
+        if (pr.name == presetName) {
+            pr = newPreset;
+            found = true;
+            break;
         }
-
-        if (keyPos != std::wstring::npos) {
-            size_t absKeyPos = presetPos + keyPos;
-            size_t lineEnd = content.find(L"\n", absKeyPos);
-            if (lineEnd == std::wstring::npos) lineEnd = content.length();
-            content.replace(absKeyPos, lineEnd - absKeyPos, newEntry);
-        } else {
-            if (secEnd > 0 && content[secEnd - 1] != L'\n') {
-                content.insert(secEnd, L"\r\n" + newEntry + L"\r\n");
-            } else {
-                content.insert(secEnd, newEntry + L"\r\n");
-            }
-        }
-    } else {
-        if (!content.empty() && content.back() != L'\n') {
-            content += L"\r\n";
-        }
-        content += L"\r\n[Presets]\r\n" + newEntry + L"\r\n";
+    }
+    if (!found) {
+        updatedCfg.presets.push_back(newPreset);
     }
 
-    HANDLE hFile = CreateFileW(cfgPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile != INVALID_HANDLE_VALUE) {
-        const unsigned char bom[] = { 0xEF, 0xBB, 0xBF };
-        DWORD written = 0;
-        WriteFile(hFile, bom, sizeof(bom), &written, NULL);
-        int len = WideCharToMultiByte(CP_UTF8, 0, content.c_str(), (int)content.length(), NULL, 0, NULL, NULL);
-        if (len > 0) {
-            std::vector<char> utf8(len);
-            WideCharToMultiByte(CP_UTF8, 0, content.c_str(), (int)content.length(), utf8.data(), len, NULL, NULL);
-            WriteFile(hFile, utf8.data(), len, &written, NULL);
-        }
-        CloseHandle(hFile);
-    }
+    SaveConfigToFile(cfgPath, updatedCfg, detectedTypeCCode);
 
     std::wstring succMsg = L"预设「" + presetName + L"」已成功保存！\n\n配置项: " + presetValStr + L"\n您可以随时在托盘菜单中一键应用该方案。";
     if (g_hTrayWnd && IsWindow(g_hTrayWnd)) {
@@ -1281,6 +1389,714 @@ void SaveCurrentStateAsPreset(HINSTANCE hInstance, const MonitorContext& ctx, co
     } else {
         MessageBoxW(NULL, succMsg.c_str(), L"预设已保存", MB_OK | MB_ICONINFORMATION);
     }
+}
+
+// -------------------------------------------------------------
+// 图形化设置窗口 (Settings Dialog) - 与 macOS 端 SettingsView 完全对齐
+// -------------------------------------------------------------
+
+struct MonComboInfo {
+    HWND hLabel = NULL;
+    HWND hCombo = NULL;
+    std::vector<DWORD> inputCodes; // 下标 0 为 0 (不改变)，后续为支持的代码
+};
+
+struct SettingsDialogState {
+    HINSTANCE hInstance = NULL;
+    HWND hDlg = NULL;
+    HWND hTab = NULL;
+    HWND hBtnOpenIni = NULL;
+    HWND hBtnSave = NULL;
+    HWND hBtnCancel = NULL;
+
+    // Tab 0 (预设方案) 控件
+    HWND hPresetList = NULL;
+    HWND hPresetBtnAdd = NULL;
+    HWND hPresetBtnDel = NULL;
+    HWND hPresetBtnUp = NULL;
+    HWND hPresetBtnDown = NULL;
+    HWND hPresetNameLabel = NULL;
+    HWND hPresetNameEdit = NULL;
+    HWND hPresetMonHeader = NULL;
+    HWND hPresetPlaceholder = NULL;
+    std::vector<MonComboInfo> monCombos;
+
+    // Tab 1 (通用偏好与联动) 控件
+    HWND hGenNotifyCheck = NULL;
+    HWND hGenAutoStartCheck = NULL;
+    HWND hGenModeLabel = NULL;
+    HWND hGenModeCombo = NULL;
+    HWND hGenTargetLabel = NULL;
+    HWND hGenTargetCombo = NULL;
+    HWND hGenCmdHeader = NULL;
+    HWND hCmdDpLabel = NULL;
+    HWND hCmdDpEdit = NULL;
+    HWND hCmdTypecLabel = NULL;
+    HWND hCmdTypecEdit = NULL;
+    HWND hCmdHdmi1Label = NULL;
+    HWND hCmdHdmi1Edit = NULL;
+    HWND hCmdHdmi2Label = NULL;
+    HWND hCmdHdmi2Edit = NULL;
+    HWND hGenCmdHint = NULL;
+
+    // 临时数据与运行时状态
+    AppConfig tempConfig;
+    const MonitorContext* pCtx = nullptr;
+    DWORD detectedTypeCCode = 15;
+    int currentPresetIndex = -1;
+    bool loadingPreset = false;
+    bool saved = false;
+    HFONT hFont = NULL;
+    HFONT hBoldFont = NULL;
+};
+
+// 切换 Tab 页面的显示/隐藏
+static void UpdateSettingsTabVisibility(SettingsDialogState* pState) {
+    if (!pState || !pState->hTab) return;
+    int curTab = TabCtrl_GetCurSel(pState->hTab);
+
+    if (curTab == 0) {
+        // Tab 0: 预设方案
+        ShowWindow(pState->hPresetList, SW_SHOW);
+        ShowWindow(pState->hPresetBtnAdd, SW_SHOW);
+        ShowWindow(pState->hPresetBtnDel, SW_SHOW);
+        ShowWindow(pState->hPresetBtnUp, SW_SHOW);
+        ShowWindow(pState->hPresetBtnDown, SW_SHOW);
+
+        bool hasSelection = (pState->currentPresetIndex >= 0 && pState->currentPresetIndex < (int)pState->tempConfig.presets.size());
+        int showRight = hasSelection ? SW_SHOW : SW_HIDE;
+        int showPlaceholder = hasSelection ? SW_HIDE : SW_SHOW;
+
+        ShowWindow(pState->hPresetNameLabel, showRight);
+        ShowWindow(pState->hPresetNameEdit, showRight);
+        ShowWindow(pState->hPresetMonHeader, showRight);
+
+        for (auto& row : pState->monCombos) {
+            ShowWindow(row.hLabel, showRight);
+            ShowWindow(row.hCombo, showRight);
+        }
+        ShowWindow(pState->hPresetPlaceholder, showPlaceholder);
+
+        // 隐藏 Tab 1 控件
+        ShowWindow(pState->hGenNotifyCheck, SW_HIDE);
+        ShowWindow(pState->hGenAutoStartCheck, SW_HIDE);
+        ShowWindow(pState->hGenModeLabel, SW_HIDE);
+        ShowWindow(pState->hGenModeCombo, SW_HIDE);
+        ShowWindow(pState->hGenTargetLabel, SW_HIDE);
+        ShowWindow(pState->hGenTargetCombo, SW_HIDE);
+        ShowWindow(pState->hGenCmdHeader, SW_HIDE);
+        ShowWindow(pState->hCmdDpLabel, SW_HIDE);
+        ShowWindow(pState->hCmdDpEdit, SW_HIDE);
+        ShowWindow(pState->hCmdTypecLabel, SW_HIDE);
+        ShowWindow(pState->hCmdTypecEdit, SW_HIDE);
+        ShowWindow(pState->hCmdHdmi1Label, SW_HIDE);
+        ShowWindow(pState->hCmdHdmi1Edit, SW_HIDE);
+        ShowWindow(pState->hCmdHdmi2Label, SW_HIDE);
+        ShowWindow(pState->hCmdHdmi2Edit, SW_HIDE);
+        ShowWindow(pState->hGenCmdHint, SW_HIDE);
+    } else {
+        // Tab 1: 通用偏好与联动
+        // 隐藏 Tab 0 控件
+        ShowWindow(pState->hPresetList, SW_HIDE);
+        ShowWindow(pState->hPresetBtnAdd, SW_HIDE);
+        ShowWindow(pState->hPresetBtnDel, SW_HIDE);
+        ShowWindow(pState->hPresetBtnUp, SW_HIDE);
+        ShowWindow(pState->hPresetBtnDown, SW_HIDE);
+        ShowWindow(pState->hPresetNameLabel, SW_HIDE);
+        ShowWindow(pState->hPresetNameEdit, SW_HIDE);
+        ShowWindow(pState->hPresetMonHeader, SW_HIDE);
+        for (auto& row : pState->monCombos) {
+            ShowWindow(row.hLabel, SW_HIDE);
+            ShowWindow(row.hCombo, SW_HIDE);
+        }
+        ShowWindow(pState->hPresetPlaceholder, SW_HIDE);
+
+        // 显示 Tab 1 控件
+        ShowWindow(pState->hGenNotifyCheck, SW_SHOW);
+        ShowWindow(pState->hGenAutoStartCheck, SW_SHOW);
+        ShowWindow(pState->hGenModeLabel, SW_SHOW);
+        ShowWindow(pState->hGenModeCombo, SW_SHOW);
+        ShowWindow(pState->hGenTargetLabel, SW_SHOW);
+        ShowWindow(pState->hGenTargetCombo, SW_SHOW);
+        ShowWindow(pState->hGenCmdHeader, SW_SHOW);
+        ShowWindow(pState->hCmdDpLabel, SW_SHOW);
+        ShowWindow(pState->hCmdDpEdit, SW_SHOW);
+        ShowWindow(pState->hCmdTypecLabel, SW_SHOW);
+        ShowWindow(pState->hCmdTypecEdit, SW_SHOW);
+        ShowWindow(pState->hCmdHdmi1Label, SW_SHOW);
+        ShowWindow(pState->hCmdHdmi1Edit, SW_SHOW);
+        ShowWindow(pState->hCmdHdmi2Label, SW_SHOW);
+        ShowWindow(pState->hCmdHdmi2Edit, SW_SHOW);
+        ShowWindow(pState->hGenCmdHint, SW_SHOW);
+    }
+}
+
+// 将右侧输入源与名称配置存回当前选中的预设方案中
+static void SaveRightPanelToPreset(SettingsDialogState* pState) {
+    if (pState->currentPresetIndex < 0 || pState->currentPresetIndex >= (int)pState->tempConfig.presets.size()) {
+        return;
+    }
+    if (pState->loadingPreset) return;
+
+    auto& preset = pState->tempConfig.presets[pState->currentPresetIndex];
+    wchar_t nameBuf[256] = { 0 };
+    GetWindowTextW(pState->hPresetNameEdit, nameBuf, 256);
+    std::wstring newName = Trim(nameBuf);
+    if (!newName.empty()) {
+        preset.name = newName;
+    }
+
+    preset.targets.clear();
+    for (size_t i = 0; i < pState->monCombos.size(); ++i) {
+        int sel = (int)SendMessageW(pState->monCombos[i].hCombo, CB_GETCURSEL, 0, 0);
+        DWORD code = 0;
+        if (sel >= 0 && sel < (int)pState->monCombos[i].inputCodes.size()) {
+            code = pState->monCombos[i].inputCodes[sel];
+        }
+        preset.targets.push_back({ std::to_wstring(i + 1), code });
+    }
+}
+
+// 将指定预设方案加载至右侧编辑面板
+static void LoadPresetToRightPanel(SettingsDialogState* pState, int index) {
+    if (index < 0 || index >= (int)pState->tempConfig.presets.size()) {
+        pState->currentPresetIndex = -1;
+        UpdateSettingsTabVisibility(pState);
+        return;
+    }
+
+    pState->loadingPreset = true;
+    pState->currentPresetIndex = index;
+    const auto& preset = pState->tempConfig.presets[index];
+
+    SetWindowTextW(pState->hPresetNameEdit, preset.name.c_str());
+
+    for (size_t i = 0; i < pState->monCombos.size(); ++i) {
+        DWORD targetCode = 0;
+        if (pState->pCtx && i < pState->pCtx->monitors.size()) {
+            const auto& mon = pState->pCtx->monitors[i];
+            size_t mon1Based = i + 1;
+            for (const auto& t : preset.targets) {
+                if (MatchMonitor(mon, mon1Based, t.monitorId)) {
+                    targetCode = t.inputCode;
+                    break;
+                }
+            }
+        } else if (i < preset.targets.size()) {
+            targetCode = preset.targets[i].inputCode;
+        }
+
+        int selIdx = 0;
+        for (size_t cIdx = 0; cIdx < pState->monCombos[i].inputCodes.size(); ++cIdx) {
+            if (pState->monCombos[i].inputCodes[cIdx] == targetCode) {
+                selIdx = static_cast<int>(cIdx);
+                break;
+            }
+        }
+        SendMessageW(pState->monCombos[i].hCombo, CB_SETCURSEL, selIdx, 0);
+    }
+
+    pState->loadingPreset = false;
+    UpdateSettingsTabVisibility(pState);
+}
+
+// 刷新左侧预设列表
+static void RefreshPresetListbox(SettingsDialogState* pState, int selectIndex = -1) {
+    SendMessageW(pState->hPresetList, LB_RESETCONTENT, 0, 0);
+    for (const auto& pr : pState->tempConfig.presets) {
+        SendMessageW(pState->hPresetList, LB_ADDSTRING, 0, (LPARAM)pr.name.c_str());
+    }
+    if (selectIndex >= 0 && selectIndex < (int)pState->tempConfig.presets.size()) {
+        SendMessageW(pState->hPresetList, LB_SETCURSEL, selectIndex, 0);
+        LoadPresetToRightPanel(pState, selectIndex);
+    } else if (!pState->tempConfig.presets.empty()) {
+        SendMessageW(pState->hPresetList, LB_SETCURSEL, 0, 0);
+        LoadPresetToRightPanel(pState, 0);
+    } else {
+        LoadPresetToRightPanel(pState, -1);
+    }
+}
+
+static BOOL CALLBACK SetChildFontProc(HWND hChild, LPARAM lParam) {
+    SendMessageW(hChild, WM_SETFONT, (WPARAM)lParam, TRUE);
+    return TRUE;
+}
+
+// 设置窗口过程函数
+static LRESULT CALLBACK SettingsDlgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    SettingsDialogState* pState = reinterpret_cast<SettingsDialogState*>(GetWindowLongPtrW(hWnd, GWLP_USERDATA));
+
+    switch (msg) {
+    case WM_CREATE: {
+        CREATESTRUCTW* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        pState = reinterpret_cast<SettingsDialogState*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(pState));
+        pState->hDlg = hWnd;
+
+        pState->hFont = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+        pState->hBoldFont = CreateFontW(-13, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+
+        // 1. Tab Control
+        pState->hTab = CreateWindowExW(0, WC_TABCONTROLW, L"",
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP,
+            12, 10, 620, 420, hWnd, (HMENU)IDC_SETTINGS_TAB, cs->hInstance, NULL);
+
+        TCITEMW ti = { 0 };
+        ti.mask = TCIF_TEXT;
+        ti.pszText = const_cast<LPWSTR>(L"📐 多显示器预设方案 (Presets)");
+        TabCtrl_InsertItem(pState->hTab, 0, &ti);
+        ti.pszText = const_cast<LPWSTR>(L"⚙️ 通用偏好与联动 (General & Commands)");
+        TabCtrl_InsertItem(pState->hTab, 1, &ti);
+
+        // 2. Tab 0 控件
+        pState->hPresetList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY,
+            24, 46, 175, 330, hWnd, (HMENU)IDC_PRESET_LIST, cs->hInstance, NULL);
+
+        pState->hPresetBtnAdd = CreateWindowExW(0, L"BUTTON", L"➕",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+            24, 384, 40, 26, hWnd, (HMENU)IDC_PRESET_ADD, cs->hInstance, NULL);
+
+        pState->hPresetBtnDel = CreateWindowExW(0, L"BUTTON", L"➖",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+            69, 384, 40, 26, hWnd, (HMENU)IDC_PRESET_DEL, cs->hInstance, NULL);
+
+        pState->hPresetBtnUp = CreateWindowExW(0, L"BUTTON", L"▲",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+            114, 384, 40, 26, hWnd, (HMENU)IDC_PRESET_UP, cs->hInstance, NULL);
+
+        pState->hPresetBtnDown = CreateWindowExW(0, L"BUTTON", L"▼",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+            159, 384, 40, 26, hWnd, (HMENU)IDC_PRESET_DOWN, cs->hInstance, NULL);
+
+        // Tab 0 右侧
+        pState->hPresetNameLabel = CreateWindowExW(0, L"STATIC", L"预设名称:",
+            WS_CHILD | WS_VISIBLE, 220, 50, 70, 20, hWnd, NULL, cs->hInstance, NULL);
+
+        pState->hPresetNameEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | WS_TABSTOP,
+            295, 48, 325, 24, hWnd, (HMENU)IDC_PRESET_NAME_EDIT, cs->hInstance, NULL);
+
+        pState->hPresetMonHeader = CreateWindowExW(0, L"STATIC", L"显示器目标输入源配置:",
+            WS_CHILD | WS_VISIBLE, 220, 84, 400, 20, hWnd, NULL, cs->hInstance, NULL);
+
+        pState->hPresetPlaceholder = CreateWindowExW(0, L"STATIC", L"从左侧列表选择或新建预设方案进行配置",
+            WS_CHILD | SS_CENTER, 220, 180, 400, 40, hWnd, NULL, cs->hInstance, NULL);
+
+        // 为连接的各台外接显示器创建目标源下拉选择器
+        if (pState->pCtx && !pState->pCtx->monitors.empty()) {
+            for (size_t i = 0; i < pState->pCtx->monitors.size(); ++i) {
+                const auto& mon = pState->pCtx->monitors[i];
+                int yRow = 114 + static_cast<int>(i) * 36;
+
+                std::wstring desc = mon.description;
+                if (desc.length() > 22) desc = desc.substr(0, 20) + L"...";
+                std::wstring monLabelText = L"🖥️ #" + std::to_wstring(i + 1) + L" " + desc + (mon.isPrimary ? L" (主):" : L":");
+
+                HWND hMonLabel = CreateWindowExW(0, L"STATIC", monLabelText.c_str(),
+                    WS_CHILD | WS_VISIBLE, 220, yRow + 3, 210, 20, hWnd, NULL, cs->hInstance, NULL);
+
+                HWND hMonCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+                    WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
+                    435, yRow, 185, 220, hWnd, (HMENU)(IDC_PRESET_MON_BASE + i), cs->hInstance, NULL);
+
+                MonComboInfo info;
+                info.hLabel = hMonLabel;
+                info.hCombo = hMonCombo;
+
+                SendMessageW(hMonCombo, CB_ADDSTRING, 0, (LPARAM)L"不改变 (Don't Change)");
+                info.inputCodes.push_back(0);
+
+                std::vector<DWORD> supported = GetSupportedInputCodes(&mon, pState->detectedTypeCCode);
+                for (DWORD code : supported) {
+                    std::wstring iname = GetInputName(code, &pState->tempConfig);
+                    wchar_t itemBuf[128];
+                    swprintf_s(itemBuf, L"%s (0x%02X)", iname.c_str(), code);
+                    SendMessageW(hMonCombo, CB_ADDSTRING, 0, (LPARAM)itemBuf);
+                    info.inputCodes.push_back(code);
+                }
+                SendMessageW(hMonCombo, CB_SETCURSEL, 0, 0);
+
+                pState->monCombos.push_back(info);
+            }
+        } else {
+            HWND hNoMon = CreateWindowExW(0, L"STATIC", L"未检测到支持 DDC/CI 的外接显示器（请确认线缆连接并开启 DDC/CI）",
+                WS_CHILD | WS_VISIBLE, 220, 114, 400, 40, hWnd, NULL, cs->hInstance, NULL);
+            MonComboInfo dummy;
+            dummy.hLabel = hNoMon;
+            pState->monCombos.push_back(dummy);
+        }
+
+        // 3. Tab 1 控件
+        pState->hGenNotifyCheck = CreateWindowExW(0, L"BUTTON", L"切换输入源成功后弹出系统气泡通知",
+            WS_CHILD | BS_AUTOCHECKBOX | WS_TABSTOP,
+            28, 48, 400, 22, hWnd, (HMENU)IDC_GENERAL_NOTIFY, cs->hInstance, NULL);
+
+        pState->hGenAutoStartCheck = CreateWindowExW(0, L"BUTTON", L"开机自启动 (登录系统后常驻系统托盘)",
+            WS_CHILD | BS_AUTOCHECKBOX | WS_TABSTOP,
+            28, 74, 400, 22, hWnd, (HMENU)IDC_GENERAL_AUTOSTART, cs->hInstance, NULL);
+
+        pState->hGenModeLabel = CreateWindowExW(0, L"STATIC", L"托盘运行模式:",
+            WS_CHILD, 28, 104, 130, 20, hWnd, NULL, cs->hInstance, NULL);
+
+        pState->hGenModeCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+            WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
+            160, 102, 260, 120, hWnd, (HMENU)IDC_GENERAL_MODE, cs->hInstance, NULL);
+        SendMessageW(pState->hGenModeCombo, CB_ADDSTRING, 0, (LPARAM)L"常驻系统托盘 (tray) - 推荐");
+        SendMessageW(pState->hGenModeCombo, CB_ADDSTRING, 0, (LPARAM)L"单次运行弹出菜单 (menu)");
+        SendMessageW(pState->hGenModeCombo, CB_ADDSTRING, 0, (LPARAM)L"单次运行轮流切换 (toggle)");
+
+        if (pState->tempConfig.mode == L"MENU") SendMessageW(pState->hGenModeCombo, CB_SETCURSEL, 1, 0);
+        else if (pState->tempConfig.mode == L"TOGGLE") SendMessageW(pState->hGenModeCombo, CB_SETCURSEL, 2, 0);
+        else SendMessageW(pState->hGenModeCombo, CB_SETCURSEL, 0, 0);
+
+        pState->hGenTargetLabel = CreateWindowExW(0, L"STATIC", L"默认切换目标:",
+            WS_CHILD, 28, 134, 130, 20, hWnd, NULL, cs->hInstance, NULL);
+
+        pState->hGenTargetCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+            WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
+            160, 132, 260, 120, hWnd, (HMENU)IDC_GENERAL_TARGET, cs->hInstance, NULL);
+        SendMessageW(pState->hGenTargetCombo, CB_ADDSTRING, 0, (LPARAM)L"仅切换主显示器 (primary) - 推荐");
+        SendMessageW(pState->hGenTargetCombo, CB_ADDSTRING, 0, (LPARAM)L"同时切换所有外接显示器 (all)");
+
+        if (pState->tempConfig.targetMonitor == L"ALL") SendMessageW(pState->hGenTargetCombo, CB_SETCURSEL, 1, 0);
+        else SendMessageW(pState->hGenTargetCombo, CB_SETCURSEL, 0, 0);
+
+        pState->hGenCmdHeader = CreateWindowExW(0, L"STATIC", L"端口联动命令 (切换至对应输入源后在后台静默执行系统命令，留空则不执行):",
+            WS_CHILD, 28, 168, 580, 20, hWnd, NULL, cs->hInstance, NULL);
+
+        pState->hCmdDpLabel = CreateWindowExW(0, L"STATIC", L"DisplayPort (0x10):",
+            WS_CHILD, 28, 198, 150, 20, hWnd, NULL, cs->hInstance, NULL);
+        pState->hCmdDpEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | ES_AUTOHSCROLL | WS_TABSTOP,
+            180, 196, 440, 24, hWnd, (HMENU)IDC_CMD_DP, cs->hInstance, NULL);
+
+        pState->hCmdTypecLabel = CreateWindowExW(0, L"STATIC", L"USB Type-C (0x0F):",
+            WS_CHILD, 28, 230, 150, 20, hWnd, NULL, cs->hInstance, NULL);
+        pState->hCmdTypecEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | ES_AUTOHSCROLL | WS_TABSTOP,
+            180, 228, 440, 24, hWnd, (HMENU)IDC_CMD_TYPEC, cs->hInstance, NULL);
+
+        pState->hCmdHdmi1Label = CreateWindowExW(0, L"STATIC", L"HDMI 1 (0x11):",
+            WS_CHILD, 28, 262, 150, 20, hWnd, NULL, cs->hInstance, NULL);
+        pState->hCmdHdmi1Edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | ES_AUTOHSCROLL | WS_TABSTOP,
+            180, 260, 440, 24, hWnd, (HMENU)IDC_CMD_HDMI1, cs->hInstance, NULL);
+
+        pState->hCmdHdmi2Label = CreateWindowExW(0, L"STATIC", L"HDMI 2 (0x12):",
+            WS_CHILD, 28, 294, 150, 20, hWnd, NULL, cs->hInstance, NULL);
+        pState->hCmdHdmi2Edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | ES_AUTOHSCROLL | WS_TABSTOP,
+            180, 292, 440, 24, hWnd, (HMENU)IDC_CMD_HDMI2, cs->hInstance, NULL);
+
+        pState->hGenCmdHint = CreateWindowExW(0, L"STATIC", L"提示：与 macOS 端快捷与联动功能对齐，支持系统命令、脚本或快捷调用（例如唤醒从机、执行 ssh/curl 等），通过后台静默异步执行。",
+            WS_CHILD, 28, 330, 590, 38, hWnd, NULL, cs->hInstance, NULL);
+
+        // 初始化 Tab 1 勾选项与联动内容
+        SendMessageW(pState->hGenNotifyCheck, BM_SETCHECK, pState->tempConfig.notify ? BST_CHECKED : BST_UNCHECKED, 0);
+        SendMessageW(pState->hGenAutoStartCheck, BM_SETCHECK, IsAutoStartEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
+
+        DWORD dpCode = 16;
+        for (const auto& kv : pState->tempConfig.customInputs) {
+            if (ToUpper(kv.first) == L"DP" || ToUpper(kv.first) == L"DP1") { dpCode = kv.second; break; }
+        }
+        DWORD tcCode = pState->detectedTypeCCode;
+        for (const auto& kv : pState->tempConfig.customInputs) {
+            if (ToUpper(kv.first) == L"TYPEC" || ToUpper(kv.first) == L"TYPE-C" || ToUpper(kv.first) == L"USBC") { tcCode = kv.second; break; }
+        }
+
+        auto getCmd = [&](DWORD code) -> std::wstring {
+            auto it = pState->tempConfig.commands.find(code);
+            return (it != pState->tempConfig.commands.end()) ? it->second : L"";
+        };
+        SetWindowTextW(pState->hCmdDpEdit, getCmd(dpCode).c_str());
+        SetWindowTextW(pState->hCmdTypecEdit, getCmd(tcCode).c_str());
+        SetWindowTextW(pState->hCmdHdmi1Edit, getCmd(17).c_str());
+        SetWindowTextW(pState->hCmdHdmi2Edit, getCmd(18).c_str());
+
+        // 4. 底部常驻按钮
+        pState->hBtnOpenIni = CreateWindowExW(0, L"BUTTON", L"📂 打开配置文件 (config.ini)",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+            15, 442, 195, 28, hWnd, (HMENU)IDC_SETTINGS_BTN_OPEN_INI, cs->hInstance, NULL);
+
+        pState->hBtnSave = CreateWindowExW(0, L"BUTTON", L"保存",
+            WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_TABSTOP,
+            440, 442, 90, 28, hWnd, (HMENU)IDOK, cs->hInstance, NULL);
+
+        pState->hBtnCancel = CreateWindowExW(0, L"BUTTON", L"取消",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+            542, 442, 90, 28, hWnd, (HMENU)IDCANCEL, cs->hInstance, NULL);
+
+        // 统一设置现代化字体
+        EnumChildWindows(hWnd, SetChildFontProc, (LPARAM)pState->hFont);
+        if (pState->hPresetMonHeader && pState->hBoldFont) SendMessageW(pState->hPresetMonHeader, WM_SETFONT, (WPARAM)pState->hBoldFont, TRUE);
+        if (pState->hGenCmdHeader && pState->hBoldFont) SendMessageW(pState->hGenCmdHeader, WM_SETFONT, (WPARAM)pState->hBoldFont, TRUE);
+
+        // 填充并选中预设
+        RefreshPresetListbox(pState, 0);
+        UpdateSettingsTabVisibility(pState);
+        return 0;
+    }
+
+    case WM_CTLCOLORSTATIC: {
+        HDC hdcStatic = (HDC)wParam;
+        SetBkColor(hdcStatic, GetSysColor(COLOR_BTNFACE));
+        return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+    }
+
+    case WM_NOTIFY: {
+        NMHDR* pNmhdr = reinterpret_cast<NMHDR*>(lParam);
+        if (pNmhdr->idFrom == IDC_SETTINGS_TAB && pNmhdr->code == TCN_SELCHANGE) {
+            SaveRightPanelToPreset(pState);
+            UpdateSettingsTabVisibility(pState);
+            return 0;
+        }
+        break;
+    }
+
+    case WM_COMMAND: {
+        int id = LOWORD(wParam);
+        int code = HIWORD(wParam);
+
+        if (id == IDC_PRESET_LIST && code == LBN_SELCHANGE) {
+            SaveRightPanelToPreset(pState);
+            int sel = (int)SendMessageW(pState->hPresetList, LB_GETCURSEL, 0, 0);
+            LoadPresetToRightPanel(pState, sel);
+            return 0;
+        }
+
+        if (id == IDC_PRESET_NAME_EDIT && code == EN_CHANGE && !pState->loadingPreset) {
+            if (pState->currentPresetIndex >= 0 && pState->currentPresetIndex < (int)pState->tempConfig.presets.size()) {
+                wchar_t buf[256] = { 0 };
+                GetWindowTextW(pState->hPresetNameEdit, buf, 256);
+                pState->tempConfig.presets[pState->currentPresetIndex].name = buf;
+
+                int curSel = pState->currentPresetIndex;
+                SendMessageW(pState->hPresetList, LB_DELETESTRING, curSel, 0);
+                SendMessageW(pState->hPresetList, LB_INSERTSTRING, curSel, (LPARAM)buf);
+                SendMessageW(pState->hPresetList, LB_SETCURSEL, curSel, 0);
+            }
+            return 0;
+        }
+
+        if (id >= IDC_PRESET_MON_BASE && id < IDC_PRESET_MON_BASE + 32 && code == CBN_SELCHANGE) {
+            SaveRightPanelToPreset(pState);
+            return 0;
+        }
+
+        if (id == IDC_PRESET_ADD) {
+            SaveRightPanelToPreset(pState);
+            MonitorPreset newPr;
+            std::wstring baseName = L"新建预设";
+            int suffix = 1;
+            bool nameExists = true;
+            while (nameExists) {
+                nameExists = false;
+                std::wstring checkName = (suffix == 1) ? baseName : (baseName + L" " + std::to_wstring(suffix));
+                for (const auto& p : pState->tempConfig.presets) {
+                    if (p.name == checkName) {
+                        nameExists = true;
+                        suffix++;
+                        break;
+                    }
+                }
+                if (!nameExists) {
+                    newPr.name = checkName;
+                }
+            }
+
+            if (pState->pCtx) {
+                for (size_t i = 0; i < pState->pCtx->monitors.size(); ++i) {
+                    newPr.targets.push_back({ std::to_wstring(i + 1), pState->pCtx->monitors[i].currentInput });
+                }
+            }
+            pState->tempConfig.presets.push_back(newPr);
+            int newIdx = static_cast<int>(pState->tempConfig.presets.size()) - 1;
+            RefreshPresetListbox(pState, newIdx);
+            SetFocus(pState->hPresetNameEdit);
+            SendMessageW(pState->hPresetNameEdit, EM_SETSEL, 0, -1);
+            return 0;
+        }
+
+        if (id == IDC_PRESET_DEL) {
+            if (pState->currentPresetIndex >= 0 && pState->currentPresetIndex < (int)pState->tempConfig.presets.size()) {
+                int idx = pState->currentPresetIndex;
+                pState->tempConfig.presets.erase(pState->tempConfig.presets.begin() + idx);
+                int nextSel = idx;
+                if (nextSel >= (int)pState->tempConfig.presets.size()) {
+                    nextSel = (int)pState->tempConfig.presets.size() - 1;
+                }
+                RefreshPresetListbox(pState, nextSel);
+            }
+            return 0;
+        }
+
+        if (id == IDC_PRESET_UP) {
+            if (pState->currentPresetIndex > 0 && pState->currentPresetIndex < (int)pState->tempConfig.presets.size()) {
+                SaveRightPanelToPreset(pState);
+                int idx = pState->currentPresetIndex;
+                std::swap(pState->tempConfig.presets[idx], pState->tempConfig.presets[idx - 1]);
+                RefreshPresetListbox(pState, idx - 1);
+            }
+            return 0;
+        }
+
+        if (id == IDC_PRESET_DOWN) {
+            if (pState->currentPresetIndex >= 0 && pState->currentPresetIndex + 1 < (int)pState->tempConfig.presets.size()) {
+                SaveRightPanelToPreset(pState);
+                int idx = pState->currentPresetIndex;
+                std::swap(pState->tempConfig.presets[idx], pState->tempConfig.presets[idx + 1]);
+                RefreshPresetListbox(pState, idx + 1);
+            }
+            return 0;
+        }
+
+        if (id == IDC_SETTINGS_BTN_OPEN_INI) {
+            std::wstring cfgPath = GetConfigPath();
+            EnsureConfigFile(cfgPath);
+            ShellExecuteW(hWnd, L"open", cfgPath.c_str(), NULL, NULL, SW_SHOWNORMAL);
+            return 0;
+        }
+
+        if (id == IDOK) {
+            SaveRightPanelToPreset(pState);
+
+            pState->tempConfig.notify = (SendMessageW(pState->hGenNotifyCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
+
+            bool autostartDesired = (SendMessageW(pState->hGenAutoStartCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            if (autostartDesired != IsAutoStartEnabled()) {
+                SetAutoStart(autostartDesired);
+            }
+
+            int modeSel = (int)SendMessageW(pState->hGenModeCombo, CB_GETCURSEL, 0, 0);
+            if (modeSel == 0) pState->tempConfig.mode = L"TRAY";
+            else if (modeSel == 1) pState->tempConfig.mode = L"MENU";
+            else if (modeSel == 2) pState->tempConfig.mode = L"TOGGLE";
+
+            int targetSel = (int)SendMessageW(pState->hGenTargetCombo, CB_GETCURSEL, 0, 0);
+            if (targetSel == 0) pState->tempConfig.targetMonitor = L"PRIMARY";
+            else if (targetSel == 1) pState->tempConfig.targetMonitor = L"ALL";
+
+            auto getEditText = [](HWND hEdit) -> std::wstring {
+                wchar_t buf[1024] = { 0 };
+                GetWindowTextW(hEdit, buf, 1024);
+                return Trim(buf);
+            };
+
+            DWORD dpCode = 16;
+            for (const auto& kv : pState->tempConfig.customInputs) {
+                if (ToUpper(kv.first) == L"DP" || ToUpper(kv.first) == L"DP1") { dpCode = kv.second; break; }
+            }
+            DWORD tcCode = pState->detectedTypeCCode;
+            for (const auto& kv : pState->tempConfig.customInputs) {
+                if (ToUpper(kv.first) == L"TYPEC" || ToUpper(kv.first) == L"TYPE-C" || ToUpper(kv.first) == L"USBC") { tcCode = kv.second; break; }
+            }
+
+            pState->tempConfig.commands[dpCode] = getEditText(pState->hCmdDpEdit);
+            pState->tempConfig.commands[tcCode] = getEditText(pState->hCmdTypecEdit);
+            pState->tempConfig.commands[17] = getEditText(pState->hCmdHdmi1Edit);
+            pState->tempConfig.commands[18] = getEditText(pState->hCmdHdmi2Edit);
+
+            std::wstring cfgPath = GetConfigPath();
+            SaveConfigToFile(cfgPath, pState->tempConfig, pState->detectedTypeCCode);
+
+            pState->saved = true;
+            DestroyWindow(hWnd);
+            return 0;
+        }
+
+        if (id == IDCANCEL) {
+            pState->saved = false;
+            DestroyWindow(hWnd);
+            return 0;
+        }
+        break;
+    }
+
+    case WM_CLOSE:
+        pState->saved = false;
+        DestroyWindow(hWnd);
+        return 0;
+
+    case WM_DESTROY:
+        if (pState->hFont) {
+            DeleteObject(pState->hFont);
+            pState->hFont = NULL;
+        }
+        if (pState->hBoldFont) {
+            DeleteObject(pState->hBoldFont);
+            pState->hBoldFont = NULL;
+        }
+        return 0;
+    }
+
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+// 唤起图形化设置窗口
+bool ShowSettingsDialog(HINSTANCE hInstance, HWND hParent, AppConfig& cfg, MonitorContext& ctx, DWORD detectedTypeCCode) {
+    WNDCLASSEXW wc = { sizeof(wc) };
+    if (!GetClassInfoExW(hInstance, L"KVMSwitchSettingsDlgClass", &wc)) {
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = SettingsDlgProc;
+        wc.hInstance = hInstance;
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"KVMSwitchSettingsDlgClass";
+        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        RegisterClassExW(&wc);
+    }
+
+    SettingsDialogState state;
+    state.hInstance = hInstance;
+    state.tempConfig = cfg;
+    state.pCtx = &ctx;
+    state.detectedTypeCCode = detectedTypeCCode;
+
+    int dlgW = 660;
+    int dlgH = 525;
+    int screenW = GetSystemMetrics(SM_CXSCREEN);
+    int screenH = GetSystemMetrics(SM_CYSCREEN);
+    int posX = (screenW - dlgW) / 2;
+    int posY = (screenH - dlgH) / 2;
+
+    HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, L"KVMSwitchSettingsDlgClass",
+        L"KVMSwitch 设置",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        posX, posY, dlgW, dlgH, hParent, NULL, hInstance, &state);
+
+    if (!hDlg) return false;
+
+    if (hParent && IsWindow(hParent)) EnableWindow(hParent, FALSE);
+    SetForegroundWindow(hDlg);
+
+    MSG msg;
+    while (IsWindow(hDlg) && GetMessageW(&msg, NULL, 0, 0)) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+            SendMessageW(hDlg, WM_COMMAND, IDCANCEL, 0);
+            continue;
+        }
+        if (IsDialogMessageW(hDlg, &msg)) {
+            continue;
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    if (hParent && IsWindow(hParent)) {
+        EnableWindow(hParent, TRUE);
+        SetForegroundWindow(hParent);
+    }
+
+    if (state.saved) {
+        cfg = state.tempConfig;
+        if (g_hTrayWnd && IsWindow(g_hTrayWnd)) {
+            UpdateTrayTooltip(g_hTrayWnd, &cfg);
+            ShowTrayBalloon(L"KVMSwitch 设置", L"设置已成功保存并生效。");
+        }
+    }
+    return state.saved;
 }
 
 // 弹出快捷菜单
@@ -1386,10 +2202,11 @@ void ShowQuickMenu(HINSTANCE hInstance, const AppConfig& cfg, MonitorContext& ct
     }
 
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hMenu, MF_STRING, ID_ACTION_SETTINGS, L"⚙️ 设置... (Settings)");
     AppendMenuW(hMenu, MF_STRING, ID_ACTION_SAVE_PRESET, L"💾 保存当前状态为多显示器预设...");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_ACTION_SHORTCUTS, L"🔗 创建桌面快捷方式 (一键切换)");
-    AppendMenuW(hMenu, MF_STRING, ID_ACTION_CONFIG, L"⚙️ 打开配置文件 (config.ini)");
+    AppendMenuW(hMenu, MF_STRING, ID_ACTION_CONFIG, L"📄 打开配置文件 (config.ini)");
     AppendMenuW(hMenu, MF_STRING, ID_ACTION_QUERY, L"🔍 检测显示器信息与输入状态");
 
     // 开机自启动选项
@@ -1414,7 +2231,14 @@ void ShowQuickMenu(HINSTANCE hInstance, const AppConfig& cfg, MonitorContext& ct
     DestroyWindow(hWnd);
 
     // 处理菜单动作
-    if (presetMenuIdToIdx.count(cmd)) {
+    if (cmd == ID_ACTION_SETTINGS) {
+        AppConfig latestCfg = LoadConfig(GetConfigPath(), detectedTypeCCode);
+        if (ShowSettingsDialog(hInstance, hWnd, latestCfg, ctx, detectedTypeCCode)) {
+            if (g_hTrayWnd && IsWindow(g_hTrayWnd)) {
+                PostMessageW(g_hTrayWnd, g_wmRefresh, 0, 0);
+            }
+        }
+    } else if (presetMenuIdToIdx.count(cmd)) {
         size_t pIdx = presetMenuIdToIdx[cmd];
         if (pIdx < cfg.presets.size()) {
             ApplyPreset(hInstance, cfg.presets[pIdx], cfg, ctx);
@@ -1514,6 +2338,7 @@ LRESULT CALLBACK TrayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
     }
     if (msg == g_wmRefresh) {
+        g_trayCfg = LoadConfig(GetConfigPath(), g_detectedTypeCCode);
         UpdateTrayTooltip(hWnd, &g_trayCfg);
         return 0;
     }
@@ -1694,6 +2519,7 @@ void ShowHelp() {
         L"  KVMSwitch.exe <数值>          直接切换到指定 VCP 60 数值 (如 15, 16, 17, 18)\n"
         L"  KVMSwitch.exe --preset <名称> (-p)  一键应用指定的多显示器预设方案\n"
         L"  KVMSwitch.exe --presets             列出所有已配置的多显示器预设方案\n"
+        L"  KVMSwitch.exe --settings (-s)       打开图形化设置窗口 (预设、偏好与联动配置)\n"
         L"  KVMSwitch.exe --toggle (-t)   在常用输入源之间轮换切换\n"
         L"  KVMSwitch.exe --menu (-m)     强制弹出快速选择菜单 (单次模式)\n"
         L"  KVMSwitch.exe --query (-q)    检测并显示当前所有显示器及输入源状态\n"
@@ -1857,6 +2683,13 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         }
     } else if (trimmedCmd == L"--CREATE-SHORTCUTS" || trimmedCmd == L"SHORTCUTS") {
         CreateAllShortcuts(&cfg);
+    } else if (trimmedCmd == L"--SETTINGS" || trimmedCmd == L"-S" || trimmedCmd == L"SETTINGS") {
+        if (ShowSettingsDialog(hInstance, NULL, cfg, ctx, detectedTypeCCode)) {
+            if (alreadyRunning) {
+                HWND hTray = FindWindowW(L"KVMSwitchTrayWindowClass", NULL);
+                if (hTray) PostMessageW(hTray, g_wmRefresh, 0, 0);
+            }
+        }
     } else if (trimmedCmd == L"--QUERY" || trimmedCmd == L"-Q" || trimmedCmd == L"QUERY") {
         ShowQueryInfo(ctx, &cfg);
     } else {
