@@ -1,0 +1,14 @@
+# KVMSwitch: 允许当前登录的桌面用户读写 DDC/CI I2C 总线
+#
+# 安装:
+#   sudo cp linux/60-kvmswitch-i2c.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger --subsystem-match=i2c-dev
+# 然后重新插拔显示器线缆或重新登录桌面。
+#
+# 如果系统不支持 systemd uaccess，可改为把用户加入 i2c 组:
+#   sudo usermod -aG i2c "$USER"
+# 并重新登录。
+
+SUBSYSTEM=="i2c-dev", TAG+="uaccess"
+KERNEL=="i2c-[0-9]*", TAG+="uaccess"

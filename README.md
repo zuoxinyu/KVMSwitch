@@ -1,8 +1,8 @@
 # KVMSwitch
 
-轻量、便携的 Windows 显示器输入源快速切换工具 (基于 Windows 原生 DDC/CI API)。
+轻量、便携的多平台显示器输入源快速切换工具 (Windows / macOS / Linux，基于 DDC/CI)。
 
-无需依赖任何第三方运行库或外部工具，即可一键在 **DisplayPort (DP)**、**HDMI 1/2** 以及 **USB Type-C** 之间快速切换。
+DDC/CI 切换本身无需额外运行库（Windows/macOS 零外部依赖；Linux 仅 GUI 可选依赖 GTK3），即可一键在 **DisplayPort (DP)**、**HDMI 1/2** 以及 **USB Type-C** 之间快速切换。Windows 端使用原生 `dxva2.dll`，macOS 端使用 Apple Silicon `IOAVService`，Linux 端直接访问 `i2c-dev`。
 
 ---
 
@@ -18,9 +18,10 @@
 - **单实例与通信机制**：已在托盘运行时再次双击不会重复创建图标，而是直接呼出切换菜单；通过快捷方式或命令行切换输入源时，常驻托盘会自动同步更新状态与悬浮提示。
 - **快捷弹出菜单 (Menu 模式)**：鼠标光标位置即刻弹出快捷选择菜单，标明当前激活的输入源，点击即可切换。
 - **一键轮换 (Toggle 模式)**：在常用输入源（如 DP ⇄ Type-C ⇄ HDMI）之间顺序轮流切换。
-- **桌面快捷方式一键生成**：内置 `--create-shortcuts` 功能，一键在桌面生成对应各输入源、所有已配置的多屏预设方案以及托盘常驻的 `.lnk` 快捷方式，可自由设置全局热键。
+- **桌面快捷方式一键生成**：内置 `--create-shortcuts` 功能，一键在桌面生成对应各输入源、所有已配置的多屏预设方案以及托盘常驻的快捷方式（Windows 为 `.lnk`，Linux 为 `.desktop`），可自由设置全局热键。
 - **联动执行命令**：支持在切换到指定输入源后，在后台静默执行系统命令（例如联动唤醒睡眠中的 Mac 等）。
 - **Per-Monitor 高 DPI 感知**：完美适配 4K 及多屏混合缩放。
+- **Linux 原生实现**：直接通过 `/dev/i2c-*` 与显示器 DDC/CI 通信，基于 sysfs 枚举 DRM 连接器；提供 GTK3 + Ayatana AppIndicator 托盘、快速切换窗口、图形设置窗口、XDG 自启动与 `.desktop` 桌面快捷方式。
 
 ---
 
@@ -125,6 +126,75 @@ cd macos
 bash build.sh
 open KVMSwitch.app
 ```
+
+### Linux (X11 / Wayland)
+Linux 版本位于 `linux/` 目录，使用 C++17 + GTK3 实现，直接通过 `i2c-dev` 访问 DDC/CI，无需 `ddcutil` 运行库：
+
+```bash
+cd linux
+bash build.sh
+./KVMSwitch --help
+```
+
+构建后可在仓库根目录将程序、图标、桌面菜单项和 udev 规则安装到系统（需要 sudo）：
+
+```bash
+sudo bash linux/install.sh
+```
+
+默认安装到 `/usr/local`：`/usr/local/bin/KVMSwitch`、`/usr/local/share/applications/kvmswitch.desktop`、`/usr/local/share/icons/hicolor/256x256/apps/kvmswitch.png`，并把当前 `config.ini` 迁移到 `~/.config/kvmswitch/config.ini`（已存在则保留）。用户级安装可在仓库根目录执行：
+
+```bash
+PREFIX="$HOME/.local" bash linux/install.sh
+```
+
+依赖（可选，缺少 GTK 时仍可编译为纯 CLI）：
+
+```bash
+# Arch Linux
+sudo pacman -S --needed base-devel gtk3 libayatana-appindicator libnotify
+
+# Debian / Ubuntu
+sudo apt install build-essential libgtk-3-dev libayatana-appindicator3-dev libnotify-dev
+```
+
+构建脚本会自动探测 `gtk+-3.0`、`ayatana-appindicator3-0.1`（或 `libappindicator3-0.1`）与 `libnotify`。没有 GTK 开发包时会自动退化为纯命令行版本；也可以显式设置 `KVMSWITCH_NO_GUI=1`。
+
+DDC/CI 需要当前用户对 `/dev/i2c-*` 有读写权限。推荐安装仓库自带的 udev 规则：
+
+```bash
+sudo cp linux/60-kvmswitch-i2c.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=i2c-dev
+```
+
+或者把用户加入 `i2c` 组并重新登录：
+
+```bash
+sudo usermod -aG i2c "$USER"
+```
+
+---
+
+## Linux 版本特性 (`linux/`)
+
+- **纯 i2c-dev DDC/CI**：从 `/sys/class/drm/card*-*` 枚举已连接的外接显示器，读取 EDID 型号名与 DDC 总线，直接构造 VCP 0x60 读写报文；Capabilities 结果按 EDID 哈希缓存在 `$XDG_CACHE_HOME/kvmswitch/caps/`，避免每次启动都耗时读取。
+- **主显示器探测**：优先通过 `xrandr` 的 `primary` 标记，其次通过 KDE `kscreen-doctor -o` 的 `priority 1`，也可用 `KVMSWITCH_PRIMARY=DP-2` 环境变量覆盖。
+- **托盘与快捷窗口**：使用 GTK3 + Ayatana AppIndicator 常驻托盘；Wayland 下二次启动或 `--menu` 会显示轻量快速切换窗口（全局 GtkMenu 弹窗在 Wayland 下不可靠）。没有 AppIndicator 时回退到 GTK StatusIcon（仅 X11）。
+- **图形设置面板**：与 Windows / macOS 对齐的“预设方案”和“通用偏好与联动”两个页签，支持预设增删、排序、重命名、各屏输入源下拉绑定、运行模式、目标显示器、通知、自启动与联动命令。
+- **多显示器预设 / 轮换 / 联动**：完全兼容 `config.ini` 的 `[Presets]`、`[Commands]` 格式；预设中的显示器标识支持 `1`、`primary`、`secondary`、连接器名或 EDID 型号。
+- **XDG 集成**：开机自启动写入 `~/.config/autostart/kvmswitch.desktop`；`--create-shortcuts` 在桌面生成 `.desktop` 快捷方式（含所有预设）。`linux/install.sh` 可安装系统级可执行文件、应用菜单项、图标与 udev 规则。
+- **单实例通信**：使用 `$XDG_RUNTIME_DIR/kvmswitch.sock` 与 `flock` 锁，托盘运行时再次启动只会转发菜单/设置请求，不会重复创建图标。
+
+Linux 端的命令行参数与 Windows 端一致（`--tray`、`--menu`、`--toggle`、`--query`、`--preset`、`--presets`、`--settings`、`--autostart-*`、`--create-shortcuts` 等），额外提供：
+
+```text
+KVMSwitch --open-config         打开 config.ini
+KVMSwitch --quit                退出正在运行的托盘实例
+KVMSwitch --version             显示版本
+```
+
+配置默认生成在可执行文件旁；若程序目录只读（例如安装到 `/usr/bin`），自动回退到 `$XDG_CONFIG_HOME/kvmswitch/config.ini`。可用 `KVMSWITCH_CONFIG=/path/to/config.ini` 覆盖。
 
 ---
 

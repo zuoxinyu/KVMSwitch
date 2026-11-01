@@ -38,3 +38,10 @@ macos/KVMSwitch.app/
 macos/*.app/
 macos/*.dSYM/
 
+
+# Linux
+linux/KVMSwitch
+linux/KVMSwitch-cli
+linux/KVMSwitch.png
+linux/config.ini
+linux/*.o
